@@ -1,7 +1,40 @@
 use proto_flow::capture::{self, response::discovered::Binding};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
+
+pub fn new_parse_response(response: capture::Response) -> anyhow::Result<Vec<Binding>> {
+    let capture::Response {
+        discovered: Some(capture::response::Discovered { mut bindings }),
+        ..
+    } = response
+    else {
+        anyhow::bail!("response is not a discovered");
+    };
+
+    // Sort bindings so they're consistently ordered on their recommended name.
+    // This reduces potential churn if an established capture is refreshed.
+    bindings.sort_by(|l, r| l.recommended_name.cmp(&r.recommended_name));
+
+    for binding in &mut bindings {
+        if binding.recommended_name.trim().is_empty() {
+            tracing::error!(
+                ?binding,
+                "connector discovered response includes a binding with an empty recommended name"
+            );
+            anyhow::bail!("connector protocol error: a binding was missing 'recommended_name'. Please contact support for assistance");
+        }
+        binding.recommended_name = normalize_recommended_name(&binding.recommended_name);
+    }
+    // Log this only once instead of for each binding
+    if bindings.iter().any(|b| !b.resource_path.is_empty()) {
+        // TODO: ensure image_name and image_tag are added to the tracing span
+        tracing::warn!("connector discovered response includes deprecated field 'resource_path'");
+    }
+
+    Ok(bindings)
+}
 
 pub fn parse_response(
     endpoint_config: &serde_json::value::RawValue,
@@ -53,6 +86,8 @@ pub struct InvalidResource {
     pub resource_json: String,
 }
 
+impl std::error::Error for InvalidResource {}
+
 impl fmt::Display for InvalidResource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let ty = match self.binding_type {
@@ -67,7 +102,7 @@ impl fmt::Display for InvalidResource {
     }
 }
 
-type ResourcePath = Vec<String>;
+pub type ResourcePath = Vec<String>;
 
 /// Extracts the value of each of the given `resource_path_pointers` and encodes
 /// them into a `ResourcePath`. Each pointed-to location must be either a string
@@ -110,6 +145,66 @@ fn index_fetched_bindings<'a>(
             }
         })
         .collect()
+}
+
+pub fn update_capture_bindings(
+    capture_name: &str,
+    model: &mut models::CaptureDef,
+    mut discovered_bindings: Vec<Binding>,
+    update_only: bool,
+    resource_path_pointers: &[String],
+) -> Result<(Vec<Binding>, BTreeSet<ResourcePath>), InvalidResource> {
+    let capture_prefix = capture_name.rsplit_once("/").unwrap().0;
+
+    let pointers = resource_path_pointers
+        .iter()
+        .map(|p| doc::Pointer::from_str(p.as_str()))
+        .collect::<Vec<_>>();
+
+    let mut existing_bindings_by_path = index_fetched_bindings(&pointers, &model.bindings)?;
+
+    let mut used_bindings = Vec::new();
+    let mut new_bindings = Vec::new();
+    for discovered_binding in discovered_bindings {
+        let Binding {
+            recommended_name,
+            resource_config_json,
+            ..
+        } = &discovered_binding;
+        let discovered_resource: Value = serde_json::from_str(&resource_config_json)
+            .expect("resource config must be valid json");
+        let discovered_resource_path =
+            resource_path(&pointers, &discovered_resource).map_err(|resource_path_pointer| {
+                InvalidResource {
+                    binding_type: BindingType::Discovered,
+                    resource_path_pointer,
+                    resource_json: resource_config_json.clone(),
+                }
+            })?;
+
+        // Remove matched bindings from the existing map, so we can tell which ones are being removed.
+        if let Some(fetched_binding) = existing_bindings_by_path.remove(&discovered_resource_path) {
+            // Preserve the existing version of a matched CaptureBinding
+            new_bindings.push(fetched_binding.clone());
+            used_bindings.push(discovered_binding);
+        } else {
+            // Create a new CaptureBinding.
+            new_bindings.push(models::CaptureBinding {
+                target: models::Collection::new(format!("{capture_prefix}/{recommended_name}")),
+                disable: update_only || discovered_binding.disable,
+                resource: models::RawValue::from_value(&discovered_resource),
+                backfill: 0,
+            });
+            if !update_only {
+                used_bindings.push(discovered_binding);
+            }
+        }
+    }
+
+    let removed_bindings = existing_bindings_by_path.into_keys().collect();
+    model.bindings = new_bindings;
+
+    Ok((used_bindings, removed_bindings))
 }
 
 pub fn merge_capture(
@@ -225,6 +320,18 @@ pub fn merge_capture(
         },
         filtered_bindings,
     ))
+}
+
+pub fn new_merge_collections(
+
+    used_bindings: Vec<Binding>,
+    draft: &mut tables::DraftCatalog,
+    db: &sqlx::PgPool,
+) -> anyhow::Result<(BTreeSet<ResourcePath>, BTreeSet<ResourcePath>)> {
+    let c
+    let collection_names = used_bindings.iter().map(|b| b.)
+
+    todo!()
 }
 
 pub fn merge_collections(

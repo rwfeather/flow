@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use crate::discovers::{Discover, DiscoverOutput};
 use crate::publications::{DefaultRetryPolicy, UpdateInferredSchemas};
 use crate::{
     controllers::{ControllerHandler, ControllerState},
@@ -1055,6 +1056,10 @@ impl ControlPlane for TestControlPlane {
 
     fn current_time(&self) -> DateTime<Utc> {
         self.inner.current_time()
+    }
+
+    async fn discover(&mut self, discover: Discover) -> anyhow::Result<DiscoverOutput> {
+        todo!()
     }
 
     async fn publish(

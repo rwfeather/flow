@@ -1,10 +1,12 @@
+use std::collections::BTreeSet;
+
 use super::{draft, logs, CatalogType, HandleResult, Handler, Id};
 use agent_sql::discovers::Row;
 use anyhow::Context;
-use models::CaptureEndpoint;
+use models::{split_image_tag, CaptureEndpoint};
 use proto_flow::{capture, flow::capture_spec};
 use serde::{Deserialize, Serialize};
-use sqlx::types::Uuid;
+use sqlx::{types::Uuid, PgPool};
 
 mod specs;
 
@@ -12,6 +14,54 @@ mod specs;
 // - Create `pub async fn discover(discover_args: ...) -> Result<tables::DraftCatalog>`
 // - call that function from the handler
 // - create a `ControlPlane::discover` function for use by controllers
+
+/// Represents the desire to discover an endpoint. The discovered bindings will be merged with
+/// those in the `base_model`.
+pub struct Discover {
+    pub capture_name: models::Capture,
+    pub data_plane_name: String,
+    pub logs_token: Uuid,
+    pub user_id: Uuid,
+    // TODO: This _should_ agree with the `autoDiscover.addNewBindings` from the `base_model`, but it is not required to.
+    pub update_only: bool,
+    pub draft: tables::DraftCatalog,
+}
+
+impl Discover {
+    fn into_error(self, error: impl Into<anyhow::Error>) -> DiscoverOutput {
+        let Discover {
+            capture_name,
+            mut draft,
+            ..
+        } = self;
+        draft.errors.insert(tables::Error {
+            scope: tables::synthetic_scope(models::CatalogType::Capture, capture_name),
+            error: error.into(),
+        });
+        DiscoverOutput {
+            draft,
+            added: Default::default(),
+            modified: Default::default(),
+            removed: Default::default(),
+        }
+    }
+}
+
+pub struct DiscoverOutput {
+    pub draft: tables::DraftCatalog,
+    pub added: BTreeSet<specs::ResourcePath>,
+    pub modified: BTreeSet<specs::ResourcePath>,
+    pub removed: BTreeSet<specs::ResourcePath>,
+}
+
+// - Load draft specs
+// - Discover
+// - Merge
+//     - Load live specs
+//     - Each binding:
+//        - Merge and return if changed
+//        - Set is_touch based on changed
+//        - Add resource path to changes if so
 
 /// JobStatus is the possible outcomes of a handled discover operation.
 #[derive(Debug, Deserialize, Serialize)]
@@ -75,6 +125,98 @@ impl Handler for DiscoverHandler {
 }
 
 impl DiscoverHandler {
+    pub async fn discover(&mut self, db: &PgPool, req: Discover) -> anyhow::Result<DiscoverOutput> {
+        let Discover {
+            capture_name,
+            data_plane_name,
+            logs_token,
+            user_id,
+            update_only,
+            draft,
+        } = &mut req;
+        let capture_name = models::Capture::new(capture_name.as_str());
+
+        let mut data_planes: tables::DataPlanes = agent_sql::data_plane::fetch_data_planes(
+            db,
+            Vec::new(),
+            data_plane_name.as_str(),
+            *user_id,
+        )
+        .await?;
+
+        let Some(data_plane) = data_planes.pop().filter(|d| d.is_default) else {
+            return Ok(req.into_error(anyhow::anyhow!("data-plane {} could not be resolved. It may not exist or you may not be authorized", data_plane_name)));
+        };
+        let Some(capture_def) = draft.captures.get_mut_by_key(&capture_name) else {
+            return Ok(req.into_error(anyhow::anyhow!(
+                "missing capture: '{capture_name}' in draft"
+            )));
+        };
+
+        let Some(models::CaptureEndpoint::Connector(connector_cfg)) =
+            capture_def.model.as_ref().map(|m| &m.endpoint)
+        else {
+            anyhow::bail!("only connector endpoints are supported");
+        };
+
+        // INFO is a good default since these are not shown in the UI, so if we're looking then
+        // there's already a problem.
+        let log_level = capture_def
+            .model
+            .as_ref()
+            .and_then(|m| m.shards.log_level.as_deref())
+            .and_then(ops::LogLevel::from_str_name)
+            .unwrap_or(ops::LogLevel::Info);
+
+        let config_json = serde_json::to_string(connector_cfg).unwrap();
+        let config_json_raw = models::RawValue::from_str(&config_json);
+        let request = capture::Request {
+            discover: Some(capture::request::Discover {
+                connector_type: capture_spec::ConnectorType::Image as i32,
+                config_json,
+            }),
+            ..Default::default()
+        }
+        .with_internal(|internal| {
+            internal.set_log_level(log_level);
+        });
+
+        let task = ops::ShardRef {
+            name: capture_name.as_str().to_owned(),
+            kind: ops::TaskType::Capture as i32,
+            ..Default::default()
+        };
+
+        let log_handler =
+            logs::ops_handler(self.logs_tx.clone(), "discover".to_string(), *logs_token);
+
+        let result = crate::ProxyConnectors::new(log_handler)
+            .unary_capture(&data_plane, task, request)
+            .await;
+
+        let response = match result {
+            Ok(response) => response,
+            Err(err) => {
+                return Ok(req.into_error(err));
+            }
+        };
+
+        let (image_name, image_tag) = split_image_tag(&connector_cfg.image);
+        let result = Self::build_merged_catalog(
+            capture_name.as_str(),
+            response,
+            &config_json_raw,
+            &image_name,
+            &image_tag,
+            *update_only,
+            *user_id,
+            txn,
+        )
+        .await?;
+
+        todo!()
+    }
+
     #[tracing::instrument(err, skip_all, fields(id=?row.id))]
     async fn process(
         &mut self,
@@ -260,6 +402,40 @@ impl DiscoverHandler {
         ))
     }
 
+    async fn new_build_merged_catalog(
+        response: capture::Response,
+        req: Discover,
+        db: &PgPool,
+    ) -> anyhow::Result<DiscoverOutput> {
+        let Discover {
+            capture_name,
+            data_plane_name,
+            logs_token,
+            user_id,
+            update_only,
+            draft,
+        } = &mut req;
+
+        let discovered_bindings = specs::new_parse_response(response)
+            .context("converting discovery response into specs")?;
+
+        let model = capture_def_mut(&*capture_name, draft)?;
+
+        let resource_path_pointers =
+            agent_sql::connector_tags::fetch_resource_path_pointers(image_name, image_tag, db)
+                .await?;
+
+        let (used_bindings, removed_bindings) = specs::update_capture_bindings(
+            capture_name.as_str(),
+            model,
+            discovered_bindings,
+            *update_only,
+            resource_path_pointers,
+        )?;
+
+        let mut modified_bindings = removed_bindings;
+    }
+
     async fn build_merged_catalog(
         capture_name: &str,
         response: capture::Response,
@@ -268,9 +444,8 @@ impl DiscoverHandler {
         image_name: &str,
         image_tag: &str,
         update_only: bool,
-        background: bool,
         user_id: Uuid,
-        txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        db: &PgPool,
     ) -> anyhow::Result<Result<models::Catalog, Vec<draft::Error>>> {
         let (endpoint, discovered_bindings) =
             specs::parse_response(endpoint_config, image_name, image_tag, response)
@@ -332,21 +507,6 @@ impl DiscoverHandler {
         // Deeply merge the capture and its bindings.
         let capture_name = models::Capture::new(capture_name);
         let existing_capture = catalog.captures.remove(&capture_name);
-        // This is a hack to prevent autoDiscovers from overwriting changes to the capture endpoint.
-        // Background discovers get prioritized behind interactive publications, so it's possible
-        // for an interactive publication to update the endpoint config after the `discovers` row
-        // has already been created but before it's been processed. This detects that condition and
-        // bails, so we can try again on the next auto-discover.
-        if existing_capture
-            .as_ref()
-            .is_some_and(|spec| background && is_endpoint_changed(&spec.endpoint, &endpoint))
-        {
-            return Ok(Err(vec![draft::Error {
-                catalog_name: capture_name.to_string(),
-                detail: format!("capture endpoint has been modified since the discover was created (will retry)"),
-                scope: None,
-            }]));
-        }
 
         let merge_result = specs::merge_capture(
             &capture_name,
@@ -406,6 +566,22 @@ impl DiscoverHandler {
 
         Ok(Ok(catalog))
     }
+}
+
+fn capture_def_mut<'a, 'b>(
+    capture_name: &'a models::Capture,
+    draft: &'b mut tables::DraftCatalog,
+) -> anyhow::Result<&'b mut models::CaptureDef> {
+    let Some(drafted) = draft.captures.get_mut_by_key(capture_name) else {
+        anyhow::bail!("expected capture '{}' to exist in draft", capture_name);
+    };
+    let Some(model) = drafted.model.as_mut() else {
+        anyhow::bail!(
+            "expected model to be drafted for capture '{}', but was a deletion",
+            capture_name
+        );
+    };
+    Ok(model)
 }
 
 fn is_endpoint_changed(a: &CaptureEndpoint, b: &CaptureEndpoint) -> bool {

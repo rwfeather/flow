@@ -178,7 +178,7 @@ pub async fn update_tag_fields(
 pub async fn fetch_resource_path_pointers(
     image_name: &str,
     image_tag: &str,
-    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    db: impl sqlx::PgExecutor<'_>,
 ) -> sqlx::Result<Vec<String>> {
     let row = sqlx::query!(
         r#"
@@ -191,7 +191,7 @@ pub async fn fetch_resource_path_pointers(
         image_name,
         image_tag
     )
-    .fetch_optional(txn)
+    .fetch_optional(db)
     .await?;
 
     Ok(row.and_then(|r| r.pointers).unwrap_or_default())

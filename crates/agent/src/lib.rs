@@ -8,6 +8,7 @@ pub(crate) mod draft;
 pub(crate) mod evolution;
 mod handlers;
 mod jobs;
+pub(crate) mod live_specs;
 pub mod logs;
 mod proxy_connectors;
 pub mod publications;

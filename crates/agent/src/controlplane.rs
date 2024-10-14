@@ -7,9 +7,12 @@ use serde_json::value::RawValue;
 use sqlx::types::Uuid;
 use std::{collections::BTreeSet, ops::Deref};
 
-use crate::publications::{
-    DefaultRetryPolicy, DraftPublication, JobStatus, NoExpansion, NoopFinalize, PublicationResult,
-    Publisher, UpdateInferredSchemas,
+use crate::{
+    discovers::{Discover, DiscoverOutput},
+    publications::{
+        DefaultRetryPolicy, DraftPublication, JobStatus, NoExpansion, NoopFinalize,
+        PublicationResult, Publisher, UpdateInferredSchemas,
+    },
 };
 
 macro_rules! unwrap_single {
@@ -67,6 +70,8 @@ pub trait ControlPlane: Send {
 
     /// Triggers controller runs for all dependents of the given `catalog_name`.
     async fn notify_dependents(&mut self, catalog_name: String) -> anyhow::Result<()>;
+
+    async fn discover(&mut self, req: Discover) -> anyhow::Result<DiscoverOutput>;
 
     /// Attempts to publish the given draft, returning a result that indicates
     /// whether it was successful. Returns an `Err` only if there was an error
@@ -284,37 +289,10 @@ impl ControlPlane for PGControlPlane {
         names: BTreeSet<String>,
     ) -> anyhow::Result<tables::LiveCatalog> {
         let names = names.into_iter().collect::<Vec<_>>();
-        let rows = agent_sql::live_specs::fetch_live_specs(self.system_user_id, &names, &self.pool)
-            .await?;
-        let mut live = tables::LiveCatalog::default();
-        for row in rows {
-            // Spec type might be null because we used to set it to null when deleting specs.
-            // For recently deleted specs, it will still be present.
-            let Some(catalog_type) = row.spec_type.map(Into::into) else {
-                continue;
-            };
-            let Some(model_json) = row.spec.as_deref() else {
-                continue;
-            };
-            let built_spec_json = row.built_spec.as_ref().ok_or_else(|| {
-                tracing::warn!(catalog_name = %row.catalog_name, id = %row.id, "got row with spec but not built_spec");
-                anyhow::anyhow!("missing built_spec for {:?}, but spec is non-null", row.catalog_name)
-            })?.deref();
+        let mut live =
+            crate::live_specs::get_live_specs(self.system_user_id, &names, &self.pool).await?;
 
-            live.add_spec(
-                catalog_type,
-                &row.catalog_name,
-                row.id.into(),
-                row.data_plane_id.into(),
-                row.last_pub_id.into(),
-                row.last_build_id.into(),
-                model_json,
-                built_spec_json,
-                row.dependency_hash,
-            )
-            .with_context(|| format!("deserializing specs for {:?}", row.catalog_name))?;
-        }
-
+        // TODO: Can we stop adding inferred schemas to live specs?
         // Fetch inferred schemas and add to live specs.
         let collection_names = live
             .collections
@@ -345,6 +323,10 @@ impl ControlPlane for PGControlPlane {
 
     fn current_time(&self) -> DateTime<Utc> {
         Utc::now()
+    }
+
+    async fn discover(&mut self, req: Discover) -> anyhow::Result<DiscoverOutput> {
+        todo!()
     }
 
     async fn publish(
