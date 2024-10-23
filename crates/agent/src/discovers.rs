@@ -1,13 +1,12 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, HashSet};
 
-use super::{draft, logs, CatalogType, HandleResult, Handler, Id};
-use agent_sql::discovers::Row;
+use super::logs;
 use anyhow::Context;
 use models::{split_image_tag, CaptureEndpoint};
 use proto_flow::{capture, flow::capture_spec};
-use serde::{Deserialize, Serialize};
 use sqlx::{types::Uuid, PgPool};
 
+pub(crate) mod handler;
 mod specs;
 
 // TODO: discovers should get a similar treatment as publications...
@@ -27,31 +26,83 @@ pub struct Discover {
     pub draft: tables::DraftCatalog,
 }
 
-impl Discover {
-    fn into_error(self, error: impl Into<anyhow::Error>) -> DiscoverOutput {
-        let Discover {
-            capture_name,
-            mut draft,
-            ..
-        } = self;
+pub type ResourcePath = Vec<String>;
+pub type Changes = BTreeMap<ResourcePath, models::Collection>;
+
+#[derive(Debug)]
+pub struct DiscoverOutput {
+    pub capture_name: models::Capture,
+    pub draft: tables::DraftCatalog,
+    pub added: Changes,
+    pub modified: Changes,
+    pub removed: Changes,
+}
+
+impl DiscoverOutput {
+    fn failed(capture_name: models::Capture, error: anyhow::Error) -> DiscoverOutput {
+        let mut draft = tables::DraftCatalog::default();
         draft.errors.insert(tables::Error {
-            scope: tables::synthetic_scope(models::CatalogType::Capture, capture_name),
-            error: error.into(),
+            scope: tables::synthetic_scope(models::CatalogType::Capture, &capture_name),
+            error,
         });
         DiscoverOutput {
+            capture_name,
             draft,
             added: Default::default(),
             modified: Default::default(),
             removed: Default::default(),
         }
     }
-}
 
-pub struct DiscoverOutput {
-    pub draft: tables::DraftCatalog,
-    pub added: BTreeSet<specs::ResourcePath>,
-    pub modified: BTreeSet<specs::ResourcePath>,
-    pub removed: BTreeSet<specs::ResourcePath>,
+    pub fn is_success(&self) -> bool {
+        self.draft.errors.is_empty()
+    }
+
+    pub fn is_unchanged(&self) -> bool {
+        self.added.is_empty() && self.modified.is_empty() && self.removed.is_empty()
+    }
+
+    pub fn prune_unchanged_specs(&mut self) -> usize {
+        assert!(
+            self.draft.errors.is_empty(),
+            "cannot prune_unchanged on discover output with errors"
+        );
+
+        let mut pruned_count = 0;
+        if self.is_unchanged() {
+            // We've discovered absolutely no changes, so remove everything from
+            // the draft. Note that this will also remove any pre-existing
+            // unrelated specs.
+            pruned_count = self.draft.spec_count();
+            self.draft = tables::DraftCatalog::default();
+        } else {
+            let DiscoverOutput {
+                ref mut draft,
+                ref added,
+                ref modified,
+                ..
+            } = self;
+            // At least one binding has changed, so the capture spec itself must
+            // be changed, and we'll only remove collection specs that have not
+            // been modified. Start by determining the set of modified
+            // collection names. Note that removed bindings are not included here
+            // because we don't delete their collection specs so there's no need
+            // to ever keep them in the draft.
+            let changed_collections = added
+                .values()
+                .chain(modified.values())
+                .collect::<HashSet<&models::Collection>>();
+
+            draft.collections.retain(|row| {
+                let retain = changed_collections.contains(&row.collection);
+                if !retain {
+                    pruned_count += 1;
+                }
+                retain
+            });
+        }
+        pruned_count
+    }
 }
 
 // - Load draft specs
@@ -62,25 +113,6 @@ pub struct DiscoverOutput {
 //        - Merge and return if changed
 //        - Set is_touch based on changed
 //        - Add resource path to changes if so
-
-/// JobStatus is the possible outcomes of a handled discover operation.
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", tag = "type")]
-pub enum JobStatus {
-    Queued,
-    WrongProtocol,
-    TagFailed,
-    ImageForbidden,
-    PullFailed,
-    DiscoverFailed,
-    MergeFailed,
-    Success {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        publication_id: Option<Id>,
-        #[serde(skip_serializing_if = "std::ops::Not::not")]
-        specs_unchanged: bool,
-    },
-}
 
 /// A DiscoverHandler is a Handler which performs discovery operations.
 pub struct DiscoverHandler {
@@ -95,35 +127,6 @@ impl DiscoverHandler {
     }
 }
 
-#[async_trait::async_trait]
-impl Handler for DiscoverHandler {
-    async fn handle(
-        &mut self,
-        pg_pool: &sqlx::PgPool,
-        allow_background: bool,
-    ) -> anyhow::Result<HandleResult> {
-        let mut txn = pg_pool.begin().await?;
-
-        let row: Row = match agent_sql::discovers::dequeue(&mut txn, allow_background).await? {
-            None => return Ok(HandleResult::NoJobs),
-            Some(row) => row,
-        };
-
-        let time_queued = chrono::Utc::now().signed_duration_since(row.updated_at);
-        let (id, status) = self.process(row, &mut txn).await?;
-        tracing::info!(%id, %time_queued, ?status, "finished");
-
-        agent_sql::discovers::resolve(id, status, &mut txn).await?;
-        txn.commit().await?;
-
-        Ok(HandleResult::HadJob)
-    }
-
-    fn table_name(&self) -> &'static str {
-        "discovers"
-    }
-}
-
 impl DiscoverHandler {
     pub async fn discover(&mut self, db: &PgPool, req: Discover) -> anyhow::Result<DiscoverOutput> {
         let Discover {
@@ -132,25 +135,25 @@ impl DiscoverHandler {
             logs_token,
             user_id,
             update_only,
-            draft,
-        } = &mut req;
-        let capture_name = models::Capture::new(capture_name.as_str());
+            mut draft,
+        } = req;
 
         let mut data_planes: tables::DataPlanes = agent_sql::data_plane::fetch_data_planes(
             db,
             Vec::new(),
             data_plane_name.as_str(),
-            *user_id,
+            user_id,
         )
         .await?;
 
         let Some(data_plane) = data_planes.pop().filter(|d| d.is_default) else {
-            return Ok(req.into_error(anyhow::anyhow!("data-plane {} could not be resolved. It may not exist or you may not be authorized", data_plane_name)));
+            return Ok(DiscoverOutput::failed(capture_name, anyhow::anyhow!("data-plane {} could not be resolved. It may not exist or you may not be authorized", data_plane_name)));
         };
         let Some(capture_def) = draft.captures.get_mut_by_key(&capture_name) else {
-            return Ok(req.into_error(anyhow::anyhow!(
-                "missing capture: '{capture_name}' in draft"
-            )));
+            return Ok(DiscoverOutput::failed(
+                capture_name.clone(),
+                anyhow::anyhow!("missing capture: '{capture_name}' in draft"),
+            ));
         };
 
         let Some(models::CaptureEndpoint::Connector(connector_cfg)) =
@@ -168,8 +171,15 @@ impl DiscoverHandler {
             .and_then(ops::LogLevel::from_str_name)
             .unwrap_or(ops::LogLevel::Info);
 
+        let (image_name, image_tag) = split_image_tag(&connector_cfg.image);
+        let resource_path_pointers =
+            agent_sql::connector_tags::fetch_resource_path_pointers(&image_name, &image_tag, db)
+                .await?;
+        if resource_path_pointers.is_empty() {
+            return Ok(DiscoverOutput::failed(capture_name, anyhow::anyhow!("there are no configured resource_path_pointers for connector '{}', cannot discover", connector_cfg.image)));
+        }
+
         let config_json = serde_json::to_string(connector_cfg).unwrap();
-        let config_json_raw = models::RawValue::from_str(&config_json);
         let request = capture::Request {
             discover: Some(capture::request::Discover {
                 connector_type: capture_spec::ConnectorType::Image as i32,
@@ -188,7 +198,7 @@ impl DiscoverHandler {
         };
 
         let log_handler =
-            logs::ops_handler(self.logs_tx.clone(), "discover".to_string(), *logs_token);
+            logs::ops_handler(self.logs_tx.clone(), "discover".to_string(), logs_token);
 
         let result = crate::ProxyConnectors::new(log_handler)
             .unary_capture(&data_plane, task, request)
@@ -197,382 +207,86 @@ impl DiscoverHandler {
         let response = match result {
             Ok(response) => response,
             Err(err) => {
-                return Ok(req.into_error(err));
+                return Ok(DiscoverOutput::failed(capture_name, err));
             }
         };
 
-        let (image_name, image_tag) = split_image_tag(&connector_cfg.image);
-        let result = Self::build_merged_catalog(
-            capture_name.as_str(),
-            response,
-            &config_json_raw,
-            &image_name,
-            &image_tag,
-            *update_only,
-            *user_id,
-            txn,
-        )
-        .await?;
-
-        todo!()
-    }
-
-    #[tracing::instrument(err, skip_all, fields(id=?row.id))]
-    async fn process(
-        &mut self,
-        row: Row,
-        txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    ) -> anyhow::Result<(Id, JobStatus)> {
-        tracing::info!(
-            %row.background,
-            %row.capture_name,
-            %row.connector_tag_id,
-            %row.connector_tag_job_success,
-            %row.created_at,
-            %row.data_plane_name,
-            %row.draft_id,
-            %row.image_name,
-            %row.image_tag,
-            %row.logs_token,
-            %row.protocol,
-            %row.updated_at,
-            %row.user_id,
-            "processing discover",
-        );
-
-        // Remove draft errors from a previous attempt.
-        agent_sql::drafts::delete_errors(row.draft_id, txn)
-            .await
-            .context("clearing old errors")?;
-
-        // Various pre-flight checks.
-        if !row.connector_tag_job_success {
-            return Ok((row.id, JobStatus::TagFailed));
-        } else if row.protocol != "capture" {
-            return Ok((row.id, JobStatus::WrongProtocol));
-        } else if !agent_sql::connector_tags::does_connector_exist(&row.image_name, &mut *txn)
-            .await?
-        {
-            return Ok((row.id, JobStatus::ImageForbidden));
-        }
-
-        let image_composed = format!("{}{}", row.image_name, row.image_tag);
-
-        // Resolve the data-plane to which this discover should be applied.
-        let mut data_planes: tables::DataPlanes = agent_sql::data_plane::fetch_data_planes(
-            &mut *txn,
-            Vec::new(),
-            &row.data_plane_name,
-            row.user_id,
-        )
-        .await?;
-
-        let Some(data_plane) = data_planes.pop().filter(|d| d.is_default) else {
-            let error = draft::Error {
-                catalog_name: row.capture_name,
-                scope: None,
-                detail: format!("data-plane {} could not be resolved. It may not exist or you may not be authorized", &row.data_plane_name),
-            };
-            draft::insert_errors(row.draft_id, vec![error], txn).await?;
-            return Ok((row.id, JobStatus::DiscoverFailed));
-        };
-
-        let request = capture::Request {
-            discover: Some(capture::request::Discover {
-                connector_type: capture_spec::ConnectorType::Image as i32,
-                config_json: serde_json::to_string(&models::ConnectorConfig {
-                    image: image_composed,
-                    config: row.endpoint_config.0.clone().into(),
-                })
-                .unwrap(),
-            }),
-            ..Default::default()
-        }
-        .with_internal(|internal| {
-            // TODO(johnny): This can be dynamically passed in.
-            // Using INFO for now because these are not shown in the UI,
-            // so if we're looking then there's already a problem.
-            internal.set_log_level(ops::LogLevel::Info);
-        });
-
-        let task = ops::ShardRef {
-            name: row.capture_name.clone(),
-            kind: ops::TaskType::Capture as i32,
-            ..Default::default()
-        };
-
-        let log_handler =
-            logs::ops_handler(self.logs_tx.clone(), "discover".to_string(), row.logs_token);
-
-        let result = crate::ProxyConnectors::new(log_handler)
-            .unary_capture(&data_plane, task, request)
-            .await;
-
-        let response = match result {
-            Ok(response) => response,
-            Err(err) => {
-                let error = draft::Error {
-                    catalog_name: row.capture_name,
-                    scope: None,
-                    detail: format!("{err:#}"),
-                };
-                draft::insert_errors(row.draft_id, vec![error], txn).await?;
-                return Ok((row.id, JobStatus::DiscoverFailed));
-            }
-        };
-
-        let result = Self::build_merged_catalog(
-            &row.capture_name,
-            response,
-            row.draft_id,
-            &row.endpoint_config.0,
-            &row.image_name,
-            &row.image_tag,
-            row.update_only,
-            row.background,
-            row.user_id,
-            txn,
-        )
-        .await?;
-
-        let catalog = match result {
-            Ok(cat) => cat,
-            Err(errors) => {
-                draft::insert_errors(row.draft_id, errors, txn).await?;
-                return Ok((row.id, JobStatus::MergeFailed));
-            }
-        };
-
-        let drafted_spec_count = catalog.spec_count();
-        draft::upsert_specs(row.draft_id, catalog, &Default::default(), txn)
-            .await
-            .context("inserting draft specs")?;
-
-        let publication_id = if row.auto_publish {
-            // Delete any draft specs that are identical to their live specs,
-            // but only if we're going to create a publication automatically.
-            // In the interactive case, these specs are still currently needed
-            // by the UI. In the future, we may be able to unconditionally prune
-            // these specs after doing some additional UI work.
-            let pruned_specs =
-                agent_sql::drafts::prune_unchanged_draft_specs(row.draft_id, txn).await?;
-
-            tracing::info!(
-                drafted_spec_count,
-                n_pruned = pruned_specs.len(),
-                "pruned draft"
-            );
-            tracing::debug!(?pruned_specs, "pruned unchanged draft specs");
-
-            if pruned_specs.len() == drafted_spec_count {
-                return Ok((
-                    row.id,
-                    JobStatus::Success {
-                        publication_id: None,
-                        specs_unchanged: true,
-                    },
-                ));
-            }
-
-            let detail = format!(
-                "system created publication in response to discover: {}",
-                row.id
-            );
-            let id = agent_sql::publications::create(
-                txn,
-                row.user_id,
-                row.draft_id,
-                row.auto_evolve,
-                detail,
-                row.background,
-                row.data_plane_name,
-            )
-            .await?;
-            Some(id)
-        } else {
-            None
-        };
-
-        Ok((
-            row.id,
-            JobStatus::Success {
-                publication_id,
-                specs_unchanged: false,
-            },
-        ))
-    }
-
-    async fn new_build_merged_catalog(
-        response: capture::Response,
-        req: Discover,
-        db: &PgPool,
-    ) -> anyhow::Result<DiscoverOutput> {
-        let Discover {
+        Self::new_build_merged_catalog(
             capture_name,
-            data_plane_name,
-            logs_token,
             user_id,
             update_only,
             draft,
-        } = &mut req;
+            response,
+            resource_path_pointers,
+            db,
+        )
+        .await
+    }
 
+    async fn new_build_merged_catalog(
+        capture_name: models::Capture,
+        user_id: uuid::Uuid,
+        update_only: bool,
+        mut draft: tables::DraftCatalog,
+        response: capture::Response,
+        resource_path_pointers: Vec<String>,
+        db: &PgPool,
+    ) -> anyhow::Result<DiscoverOutput> {
         let discovered_bindings = specs::new_parse_response(response)
             .context("converting discovery response into specs")?;
 
-        let model = capture_def_mut(&*capture_name, draft)?;
+        let tables::DraftCatalog {
+            ref mut captures,
+            ref mut collections,
+            ..
+        } = &mut draft;
+        let model = capture_def_mut(&capture_name, captures)?;
 
-        let resource_path_pointers =
-            agent_sql::connector_tags::fetch_resource_path_pointers(image_name, image_tag, db)
-                .await?;
-
-        let (used_bindings, removed_bindings) = specs::update_capture_bindings(
+        let pointers = resource_path_pointers
+            .iter()
+            .map(|p| doc::Pointer::from_str(p.as_str()))
+            .collect::<Vec<_>>();
+        let (used_bindings, added_bindings, removed_bindings) = specs::update_capture_bindings(
             capture_name.as_str(),
             model,
             discovered_bindings,
-            *update_only,
-            resource_path_pointers,
+            update_only,
+            &pointers,
         )?;
 
-        let mut modified_bindings = removed_bindings;
-    }
-
-    async fn build_merged_catalog(
-        capture_name: &str,
-        response: capture::Response,
-        draft_id: Id,
-        endpoint_config: &serde_json::value::RawValue,
-        image_name: &str,
-        image_tag: &str,
-        update_only: bool,
-        user_id: Uuid,
-        db: &PgPool,
-    ) -> anyhow::Result<Result<models::Catalog, Vec<draft::Error>>> {
-        let (endpoint, discovered_bindings) =
-            specs::parse_response(endpoint_config, image_name, image_tag, response)
-                .context("converting discovery response into specs")?;
-
-        if discovered_bindings
-            .iter()
-            .any(|b| b.recommended_name.is_empty())
-        {
-            tracing::error!(
-                ?discovered_bindings,
-                %capture_name,
-                %draft_id,
-                %image_name,
-                %image_tag,
-                "connector discovered response includes a binding with an empty recommended_name"
-            );
-            return Ok(Err(vec![draft::Error {
-                catalog_name: capture_name.to_string(),
-                scope: None,
-                detail: "connector protocol error: a binding was missing 'recommended_name'. Please contact support for assistance".to_string(),
-            }]));
-        }
-
-        // Catalog we'll build up with the merged capture and collections.
-        let mut catalog = models::Catalog::default();
-
-        // Resolve the current capture, if one exists.
-        let resolved = agent_sql::discovers::resolve_merge_target_specs(
-            &[capture_name],
-            CatalogType::Capture,
-            draft_id,
-            user_id,
-            txn,
-        )
-        .await
-        .context("resolving the current capture")?;
-
-        let errors = draft::extend_catalog(
-            &mut catalog,
-            resolved
-                .iter()
-                .map(|r| (CatalogType::Capture, capture_name, r.spec.0.as_ref())),
-        );
-        if !errors.is_empty() {
-            return Ok(Err(errors));
-        }
-
-        // TODO: As of 2023-11, resource_path_pointers are allowed to be empty.
-        // `merge_capture` will just log a warning if they are. But we plan to
-        // soon require that they are never empty.
-        let resource_path_pointers =
-            agent_sql::connector_tags::fetch_resource_path_pointers(image_name, image_tag, txn)
-                .await?;
-        if resource_path_pointers.is_empty() {
-            tracing::warn!(%image_name, %image_tag, %capture_name, "merging bindings using legacy behavior because resource_path_pointers are missing");
-        }
-
-        // Deeply merge the capture and its bindings.
-        let capture_name = models::Capture::new(capture_name);
-        let existing_capture = catalog.captures.remove(&capture_name);
-
-        let merge_result = specs::merge_capture(
-            &capture_name,
-            endpoint,
-            discovered_bindings,
-            existing_capture,
-            update_only,
-            &resource_path_pointers,
-        );
-        let (merged_capture, discovered_bindings) = match merge_result {
-            Ok(ok) => ok,
-            Err(invalid_resource) => {
-                return Ok(Err(vec![draft::Error {
-                    catalog_name: capture_name.to_string(),
-                    scope: None,
-                    detail: invalid_resource.to_string(),
-                }]))
-            }
-        };
-        let targets = merged_capture
+        let collection_names = model
             .bindings
             .iter()
-            .map(|models::CaptureBinding { target, .. }| target.clone())
+            .map(|b| b.target.to_string())
             .collect::<Vec<_>>();
-
-        catalog.captures.insert(capture_name, merged_capture); // Replace merged capture.
-
-        // Now resolve all targeted collections, if they exist.
-        let resolved = agent_sql::discovers::resolve_merge_target_specs(
-            &targets.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
-            CatalogType::Collection,
-            draft_id,
+        let live = crate::live_specs::get_live_specs(
             user_id,
-            txn,
+            &collection_names,
+            Some(models::Capability::Read),
+            db,
         )
-        .await
-        .context("resolving the current capture")?;
+        .await?;
 
-        let errors = draft::extend_catalog(
-            &mut catalog,
-            resolved.iter().map(|r| {
-                (
-                    CatalogType::Collection,
-                    r.catalog_name.as_str(),
-                    r.spec.0.as_ref(),
-                )
-            }),
-        );
-        if !errors.is_empty() {
-            return Ok(Err(errors));
-        }
+        let mut modified_bindings =
+            specs::new_merge_collections(used_bindings, collections, &live.collections)?;
+        // Don't report a binding as both added and modified, because that'd just be confusing
+        modified_bindings.retain(|path, _| !added_bindings.contains_key(path));
 
-        // Now deeply merge all captured collections.
-        // Post-condition: `catalog` reflects the final outcome of our operation.
-        catalog.collections =
-            specs::merge_collections(discovered_bindings, catalog.collections, targets);
-
-        Ok(Ok(catalog))
+        Ok(DiscoverOutput {
+            capture_name,
+            draft,
+            added: added_bindings,
+            modified: modified_bindings,
+            removed: removed_bindings,
+        })
     }
 }
 
 fn capture_def_mut<'a, 'b>(
     capture_name: &'a models::Capture,
-    draft: &'b mut tables::DraftCatalog,
+    draft: &'b mut tables::DraftCaptures,
 ) -> anyhow::Result<&'b mut models::CaptureDef> {
-    let Some(drafted) = draft.captures.get_mut_by_key(capture_name) else {
+    let Some(drafted) = draft.get_mut_by_key(capture_name) else {
         anyhow::bail!("expected capture '{}' to exist in draft", capture_name);
     };
     let Some(model) = drafted.model.as_mut() else {
@@ -584,24 +298,15 @@ fn capture_def_mut<'a, 'b>(
     Ok(model)
 }
 
-fn is_endpoint_changed(a: &CaptureEndpoint, b: &CaptureEndpoint) -> bool {
-    let CaptureEndpoint::Connector(cfga) = a else {
-        panic!("discovers handler doesn't support local connectors");
-    };
-    let CaptureEndpoint::Connector(cfgb) = b else {
-        panic!("discovers handler doesn't support local connectors");
-    };
-    cfga.image != cfgb.image || cfga.config.get().trim() != cfgb.config.get().trim()
-}
-
 #[cfg(test)]
 mod test {
 
-    use super::{Id, Uuid};
+    use models::Id;
     use proto_flow::capture;
     use serde_json::json;
     use sqlx::Connection;
     use std::str::FromStr;
+    use uuid::Uuid;
 
     const FIXED_DATABASE_URL: &str = "postgresql://postgres:postgres@localhost:5432/postgres";
 

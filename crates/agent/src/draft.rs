@@ -45,6 +45,102 @@ impl From<LockFailure> for Error {
     }
 }
 
+pub async fn load_draft(
+    draft_id: Id,
+    db: impl sqlx::PgExecutor<'static>,
+) -> anyhow::Result<tables::DraftCatalog> {
+    let rows = agent_sql::drafts::fetch_draft_specs(draft_id.into(), db).await?;
+    let mut draft = tables::DraftCatalog::default();
+
+    for row in rows {
+        let Some(spec_type) = row.spec_type.map(Into::into) else {
+            let scope = tables::synthetic_scope("deletion", &row.catalog_name);
+            draft.errors.push(tables::Error {
+                scope,
+                error: anyhow::anyhow!(
+                    "draft contains a deletion of {:?}, but no such live spec exists",
+                    row.catalog_name
+                ),
+            });
+            continue;
+        };
+        let scope = tables::synthetic_scope(spec_type, &row.catalog_name);
+
+        if let Err(err) = draft.add_spec(
+            spec_type,
+            &row.catalog_name,
+            scope,
+            row.expect_pub_id.map(Into::into),
+            row.spec.as_deref().map(|j| &**j),
+            false, // !is_touch
+        ) {
+            draft.errors.push(err);
+        }
+    }
+    Ok(draft)
+}
+
+pub async fn upsert_draft_catalog(
+    draft_id: Id,
+    catalog: &tables::DraftCatalog,
+    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> anyhow::Result<()> {
+    let tables::DraftCatalog {
+        captures,
+        collections,
+        materializations,
+        tests,
+        ..
+    } = catalog;
+    for row in collections {
+        drafts_sql::upsert_spec(
+            draft_id,
+            row.collection.as_str(),
+            row.model.as_ref(),
+            CatalogType::Collection,
+            row.expect_pub_id,
+            txn,
+        )
+        .await?;
+    }
+    for row in captures {
+        drafts_sql::upsert_spec(
+            draft_id,
+            row.capture.as_str(),
+            row.model.as_ref(),
+            CatalogType::Capture,
+            row.expect_pub_id,
+            txn,
+        )
+        .await?;
+    }
+    for row in materializations {
+        drafts_sql::upsert_spec(
+            draft_id,
+            row.materialization.as_str(),
+            row.model.as_ref(),
+            CatalogType::Materialization,
+            row.expect_pub_id,
+            txn,
+        )
+        .await?;
+    }
+    for row in tests {
+        drafts_sql::upsert_spec(
+            draft_id,
+            row.test.as_str(),
+            row.model.as_ref(),
+            CatalogType::Test,
+            row.expect_pub_id,
+            txn,
+        )
+        .await?;
+    }
+
+    agent_sql::drafts::touch(draft_id, txn).await?;
+    Ok(())
+}
+
 /// upsert_specs updates the given draft with specifications of the catalog.
 /// The `expect_pub_ids` parameter is used to lookup the `last_pub_id` by catalog name.
 /// For each item in the catalog, if an entry exists in `expect_pub_ids`, then it will
