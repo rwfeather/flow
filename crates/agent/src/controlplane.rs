@@ -289,8 +289,13 @@ impl ControlPlane for PGControlPlane {
         names: BTreeSet<String>,
     ) -> anyhow::Result<tables::LiveCatalog> {
         let names = names.into_iter().collect::<Vec<_>>();
-        let mut live =
-            crate::live_specs::get_live_specs(self.system_user_id, &names, &self.pool).await?;
+        let mut live = crate::live_specs::get_live_specs(
+            self.system_user_id,
+            &names,
+            None, // don't filter based on user capability
+            &self.pool,
+        )
+        .await?;
 
         // TODO: Can we stop adding inferred schemas to live specs?
         // Fetch inferred schemas and add to live specs.

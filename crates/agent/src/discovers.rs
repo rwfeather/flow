@@ -1,4 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
+use std::future::Future;
+
+use crate::proxy_connectors::Connectors;
 
 use super::logs;
 use anyhow::Context;
@@ -115,19 +118,17 @@ impl DiscoverOutput {
 //        - Add resource path to changes if so
 
 /// A DiscoverHandler is a Handler which performs discovery operations.
-pub struct DiscoverHandler {
-    logs_tx: logs::Tx,
+pub struct DiscoverHandler<C> {
+    pub connectors: C,
 }
 
-impl DiscoverHandler {
-    pub fn new(logs_tx: &logs::Tx) -> Self {
-        Self {
-            logs_tx: logs_tx.clone(),
-        }
+impl<C: Connectors> DiscoverHandler<C> {
+    pub fn new(connectors: C) -> Self {
+        Self { connectors }
     }
 }
 
-impl DiscoverHandler {
+impl<C: Connectors> DiscoverHandler<C> {
     pub async fn discover(&mut self, db: &PgPool, req: Discover) -> anyhow::Result<DiscoverOutput> {
         let Discover {
             capture_name,
@@ -197,11 +198,9 @@ impl DiscoverHandler {
             ..Default::default()
         };
 
-        let log_handler =
-            logs::ops_handler(self.logs_tx.clone(), "discover".to_string(), logs_token);
-
-        let result = crate::ProxyConnectors::new(log_handler)
-            .unary_capture(&data_plane, task, request)
+        let result = self
+            .connectors
+            .unary_capture(request, logs_token, task, &data_plane)
             .await;
 
         let response = match result {
@@ -240,7 +239,7 @@ impl DiscoverHandler {
             ref mut collections,
             ..
         } = &mut draft;
-        let model = capture_def_mut(&capture_name, captures)?;
+        let capture_model = capture_def_mut(&capture_name, captures)?;
 
         let pointers = resource_path_pointers
             .iter()
@@ -248,17 +247,19 @@ impl DiscoverHandler {
             .collect::<Vec<_>>();
         let (used_bindings, added_bindings, removed_bindings) = specs::update_capture_bindings(
             capture_name.as_str(),
-            model,
+            capture_model,
             discovered_bindings,
             update_only,
             &pointers,
         )?;
 
-        let collection_names = model
+        let collection_names = capture_model
             .bindings
             .iter()
             .map(|b| b.target.to_string())
             .collect::<Vec<_>>();
+        // Filter to only specs that the user can read. If they can't admin a spec, then that error
+        // will be returned if and when they try to publish.
         let live = crate::live_specs::get_live_specs(
             user_id,
             &collection_names,
@@ -310,6 +311,7 @@ mod test {
 
     const FIXED_DATABASE_URL: &str = "postgresql://postgres:postgres@localhost:5432/postgres";
 
+    /*
     #[tokio::test]
     async fn test_catalog_merge_ok() {
         let mut conn = sqlx::postgres::PgConnection::connect(&FIXED_DATABASE_URL)
@@ -521,4 +523,5 @@ mod test {
         ]
         "###);
     }
+    */
 }

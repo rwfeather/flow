@@ -142,6 +142,7 @@ sqlx = { version = "0.6", features = [
     "chrono",
     "json",
     "macros",
+    "offline",
     "postgres",
     "runtime-tokio-native-tls",
     "uuid",

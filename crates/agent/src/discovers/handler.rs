@@ -1,5 +1,5 @@
 use super::{Discover, DiscoverHandler};
-use crate::{draft, HandleResult, Handler, Id};
+use crate::{draft, proxy_connectors::Connectors, HandleResult, Handler, Id};
 use agent_sql::discovers::Row;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -16,16 +16,25 @@ pub enum JobStatus {
     DiscoverFailed,
     MergeFailed,
     Success {
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         publication_id: Option<Id>,
-        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         specs_unchanged: bool,
     },
     DeprecatedBackground,
 }
 
+impl JobStatus {
+    pub fn is_success(&self) -> bool {
+        match self {
+            JobStatus::Success { .. } => true,
+            _ => false,
+        }
+    }
+}
+
 #[async_trait::async_trait]
-impl Handler for DiscoverHandler {
+impl<C: Connectors> Handler for DiscoverHandler<C> {
     async fn handle(
         &mut self,
         pg_pool: &sqlx::PgPool,
@@ -53,7 +62,7 @@ impl Handler for DiscoverHandler {
     }
 }
 
-impl DiscoverHandler {
+impl<C: Connectors> DiscoverHandler<C> {
     #[tracing::instrument(err, skip_all, fields(id=?row.id, draft_id = ?row.draft_id))]
     async fn process(
         &mut self,
@@ -176,6 +185,8 @@ async fn prepare_discover(
         }
     } else {
         let name = &[capture_name.to_string()];
+        // Filter to only specs that the user can read. If they can't admin, then wait until they
+        // try to publish to surface that error.
         let live =
             crate::live_specs::get_live_specs(user_id, name, Some(models::Capability::Read), pool)
                 .await?;

@@ -1,4 +1,5 @@
 use super::{Changes, ResourcePath};
+use anyhow::Context;
 use proto_flow::capture::{self, response::discovered::Binding};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -112,7 +113,7 @@ fn index_fetched_bindings<'a>(
 }
 
 #[derive(Debug)]
-pub struct EnabledBinding {
+pub struct UsedBinding {
     target: models::Collection,
     document_schema: models::Schema,
     key: Vec<String>,
@@ -125,7 +126,7 @@ pub fn update_capture_bindings(
     discovered_bindings: Vec<Binding>,
     update_only: bool,
     resource_path_pointers: &[doc::Pointer],
-) -> Result<(Vec<EnabledBinding>, Changes, Changes), InvalidResource> {
+) -> anyhow::Result<(Vec<UsedBinding>, Changes, Changes)> {
     assert!(
         !resource_path_pointers.is_empty(),
         "expected resource_path_pointers to be non-empty"
@@ -135,7 +136,7 @@ pub fn update_capture_bindings(
     let mut existing_bindings_by_path =
         index_fetched_bindings(resource_path_pointers, &model.bindings)?;
     let mut added_resources = BTreeMap::new();
-    let mut enabled_bindings = Vec::new();
+    let mut used_bindings = Vec::with_capacity(discovered_bindings.len());
 
     let mut next_bindings = Vec::new();
     for discovered_binding in discovered_bindings {
@@ -144,14 +145,13 @@ pub fn update_capture_bindings(
             resource_config_json,
             document_schema_json,
             key,
-            disable,
-            resource_path: _, // no touchy
+            ..
         } = discovered_binding;
         // Don't use the deprecated `resource_path` on the `proto_flow::...::Binding` struct.
         // Instead extract the resource path from the `resource_config_json` using the
         // `resource_path_pointers` from the `connector_tags` row.
-        let discovered_resource: Value = serde_json::from_str(&resource_config_json)
-            .expect("resource config must be valid json");
+        let discovered_resource: Value =
+            serde_json::from_str(&resource_config_json).context("parsing resource config")?;
         let resource_path = resource_path(resource_path_pointers, &discovered_resource).map_err(
             |resource_path_pointer| InvalidResource {
                 binding_type: BindingType::Discovered,
@@ -174,17 +174,16 @@ pub fn update_capture_bindings(
                 backfill: 0,
             }
         };
-        if !disable {
-            let document_schema =
-                models::Schema::new(models::RawValue::from_string(document_schema_json).unwrap());
-            let target = new_binding.target.clone();
-            enabled_bindings.push(EnabledBinding {
-                target,
-                document_schema,
-                key,
-                resource_path,
-            });
-        }
+        let document_schema = models::Schema::new(
+            models::RawValue::from_str(&document_schema_json)
+                .context("parsing discovered collection schema")?,
+        );
+        used_bindings.push(UsedBinding {
+            target: new_binding.target.clone(),
+            document_schema,
+            key,
+            resource_path,
+        });
         next_bindings.push(new_binding);
     }
 
@@ -195,18 +194,18 @@ pub fn update_capture_bindings(
         .collect();
     model.bindings = next_bindings;
 
-    Ok((enabled_bindings, added_resources, removed_resources))
+    Ok((used_bindings, added_resources, removed_resources))
 }
 
 pub fn new_merge_collections(
-    used_bindings: Vec<EnabledBinding>,
+    used_bindings: Vec<UsedBinding>,
     draft: &mut tables::DraftCollections,
     live: &tables::LiveCollections,
 ) -> anyhow::Result<Changes> {
     let mut modified_collections = Changes::new();
 
     for binding in used_bindings {
-        let EnabledBinding {
+        let UsedBinding {
             target,
             document_schema,
             key,
@@ -380,7 +379,7 @@ mod tests {
     fn test_merge_collection() {
         let discovered_bindings = vec![
             // case/1: if there is no fetched collection, one is assembled.
-            EnabledBinding {
+            UsedBinding {
                 target: models::Collection::new("case/1"),
                 document_schema: models::Schema::new(
                     models::RawValue::from_str(r#"{"const": 42}"#).unwrap(),
@@ -389,7 +388,7 @@ mod tests {
                 resource_path: string_vec(&["1"]),
             },
             // case/2: expect key and schema are updated, but other fields remain.
-            EnabledBinding {
+            UsedBinding {
                 target: models::Collection::new("case/2"),
                 document_schema: models::Schema::new(
                     models::RawValue::from_str(r#"{"const": 42}"#).unwrap(),
@@ -398,7 +397,7 @@ mod tests {
                 resource_path: string_vec(&["2"]),
             },
             // case/3: If discovered key is empty, it doesn't replace the collection key.
-            EnabledBinding {
+            UsedBinding {
                 target: models::Collection::new("case/3"),
                 document_schema: models::Schema::new(
                     models::RawValue::from_str(r#"{"const": 42}"#).unwrap(),
@@ -407,7 +406,7 @@ mod tests {
                 resource_path: string_vec(&["3"]),
             },
             // case/4: If fetched collection has read & write schemas, only the write schema is updated.
-            EnabledBinding {
+            UsedBinding {
                 target: models::Collection::new("case/4"),
                 document_schema: models::Schema::new(
                     models::RawValue::from_str(r#"{ "const": "write!", "x-infer-schema": true }"#)
@@ -417,7 +416,7 @@ mod tests {
                 resource_path: string_vec(&["4"]),
             },
             // case/5: If there is no fetched collection but schema inference is used, an initial read schema is created.
-            EnabledBinding {
+            UsedBinding {
                 target: models::Collection::new("case/5"),
                 document_schema: models::Schema::new(
                     models::RawValue::from_str(r#"{ "const": "write!", "x-infer-schema": true }"#)
@@ -427,7 +426,7 @@ mod tests {
                 resource_path: string_vec(&["5"]),
             },
             // case/6: The fetched collection did not use schema inference, but now does.
-            EnabledBinding {
+            UsedBinding {
                 target: models::Collection::new("case/5"),
                 document_schema: models::Schema::new(
                     models::RawValue::from_str(r#"{ "const": "write!", "x-infer-schema": true }"#)
@@ -646,6 +645,7 @@ mod tests {
             &pointers,
         )
         .expect_err("should fail because stream is not a string");
+        let err = err.downcast::<InvalidResource>().unwrap();
         assert_eq!(BindingType::Discovered, err.binding_type);
         assert_eq!("/stream", err.resource_path_pointer);
 
@@ -658,6 +658,7 @@ mod tests {
             &pointers,
         )
         .expect_err("should fail because stream is not a string");
+        let err = err.downcast::<InvalidResource>().unwrap();
         assert_eq!(BindingType::Existing, err.binding_type);
         assert_eq!("/stream", err.resource_path_pointer);
     }
