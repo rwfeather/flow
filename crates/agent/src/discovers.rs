@@ -1,11 +1,9 @@
 use std::collections::{BTreeMap, HashSet};
-use std::future::Future;
 
 use crate::proxy_connectors::Connectors;
 
-use super::logs;
 use anyhow::Context;
-use models::{split_image_tag, CaptureEndpoint};
+use models::split_image_tag;
 use proto_flow::{capture, flow::capture_spec};
 use sqlx::{types::Uuid, PgPool};
 
@@ -210,7 +208,7 @@ impl<C: Connectors> DiscoverHandler<C> {
             }
         };
 
-        Self::new_build_merged_catalog(
+        let output = Self::new_build_merged_catalog(
             capture_name,
             user_id,
             update_only,
@@ -219,7 +217,21 @@ impl<C: Connectors> DiscoverHandler<C> {
             resource_path_pointers,
             db,
         )
-        .await
+        .await?;
+
+        if output.is_success() {
+            tracing::info!(
+                added = ?output.added,
+                modified = ?output.modified,
+                removed = ?output.removed,
+                "discover merge success");
+        } else {
+            tracing::warn!(
+                errors = ?output.draft.errors,
+                "discover merge failed"
+            );
+        }
+        Ok(output)
     }
 
     async fn new_build_merged_catalog(
@@ -231,8 +243,8 @@ impl<C: Connectors> DiscoverHandler<C> {
         resource_path_pointers: Vec<String>,
         db: &PgPool,
     ) -> anyhow::Result<DiscoverOutput> {
-        let discovered_bindings = specs::new_parse_response(response)
-            .context("converting discovery response into specs")?;
+        let discovered_bindings =
+            specs::parse_response(response).context("converting discovery response into specs")?;
 
         let tables::DraftCatalog {
             ref mut captures,
@@ -269,7 +281,7 @@ impl<C: Connectors> DiscoverHandler<C> {
         .await?;
 
         let mut modified_bindings =
-            specs::new_merge_collections(used_bindings, collections, &live.collections)?;
+            specs::merge_collections(used_bindings, collections, &live.collections)?;
         // Don't report a binding as both added and modified, because that'd just be confusing
         modified_bindings.retain(|path, _| !added_bindings.contains_key(path));
 
@@ -297,231 +309,4 @@ fn capture_def_mut<'a, 'b>(
         );
     };
     Ok(model)
-}
-
-#[cfg(test)]
-mod test {
-
-    use models::Id;
-    use proto_flow::capture;
-    use serde_json::json;
-    use sqlx::Connection;
-    use std::str::FromStr;
-    use uuid::Uuid;
-
-    const FIXED_DATABASE_URL: &str = "postgresql://postgres:postgres@localhost:5432/postgres";
-
-    /*
-    #[tokio::test]
-    async fn test_catalog_merge_ok() {
-        let mut conn = sqlx::postgres::PgConnection::connect(&FIXED_DATABASE_URL)
-            .await
-            .unwrap();
-        let mut txn = conn.begin().await.unwrap();
-
-        sqlx::query(
-            r#"
-            with
-            p1 as (
-                insert into user_grants(user_id, object_role, capability) values
-                ('11111111-1111-1111-1111-111111111111', 'aliceCo/', 'admin')
-            ),
-            p2 as (
-                insert into drafts (id, user_id) values
-                ('dddddddddddddddd', '11111111-1111-1111-1111-111111111111')
-            ),
-            p3 as (
-                insert into live_specs (catalog_name, spec_type, spec) values
-                -- Existing collection which is deeply merged.
-                ('aliceCo/existing-collection', 'collection', '{
-                    "key": ["/old/key"],
-                    "writeSchema": false,
-                    "readSchema": {"const": "read!"}
-                }')
-            ),
-            p4 as (
-                insert into draft_specs (draft_id, catalog_name, spec_type, spec) values
-                -- Capture which is deeply merged (modified resource config and `interval` are preserved).
-                ('dddddddddddddddd', 'aliceCo/dir/source-thingy', 'capture', '{
-                    "bindings": [
-                        { "resource": { "table": "foo", "modified": 1 }, "target": "aliceCo/existing-collection" }
-                    ],
-                    "endpoint": { "connector": { "config": { "fetched": 1 }, "image": "old/image" } },
-                    "interval": "10m"
-                }'),
-                -- Drafted collection which isn't (yet) linked to the capture, but collides
-                -- with a binding being added. Expect `projections` are preserved in the merge.
-                ('dddddddddddddddd', 'aliceCo/dir/quz', 'collection', '{
-                    "key": ["/old/key"],
-                    "schema": false,
-                    "projections": {"a-field": "/some/ptr"}
-                }')
-            )
-            select 1;
-            "#,
-        )
-        .execute(&mut txn)
-        .await
-        .unwrap();
-
-        let response : capture::Response = serde_json::from_value(json!({
-            "discovered": {
-                "bindings": [
-                    {"documentSchema": {"const": "write!"}, "key": ["/foo"], "recommendedName": "foo", "resourceConfig": {"table": "foo"}},
-                    {"documentSchema": {"const": "bar"}, "key": ["/bar"], "recommendedName": "bar", "resourceConfig": {"table": "bar"}},
-                    {"documentSchema": {"const": "quz"}, "key": ["/quz"], "recommendedName": "quz", "resourceConfig": {"table": "quz"}},
-                ],
-            }
-        })).unwrap();
-
-        let endpoint_config =
-            serde_json::value::to_raw_value(&json!({"some": "endpoint-config"})).unwrap();
-
-        let result = super::DiscoverHandler::build_merged_catalog(
-            "aliceCo/dir/source-thingy",
-            response,
-            Id::from_hex("dddddddddddddddd").unwrap(),
-            &endpoint_config,
-            "ghcr.io/estuary/source-thingy",
-            ":v1",
-            false,
-            false,
-            Uuid::from_str("11111111-1111-1111-1111-111111111111").unwrap(),
-            &mut txn,
-        )
-        .await;
-
-        let catalog = result.unwrap().unwrap();
-        insta::assert_json_snapshot!(json!(catalog));
-    }
-
-    #[tokio::test]
-    async fn test_catalog_merge_endpoint_changed() {
-        let mut conn = sqlx::postgres::PgConnection::connect(&FIXED_DATABASE_URL)
-            .await
-            .unwrap();
-        let mut txn = conn.begin().await.unwrap();
-
-        sqlx::query(
-            r#"
-            with
-            p1 as (
-                insert into user_grants(user_id, object_role, capability) values
-                ('11111111-1111-1111-1111-111111111111', 'aliceCo/', 'admin')
-            ),
-            p2 as (
-                insert into drafts (id, user_id) values
-                ('eeeeeeeeeeeeeeee', '11111111-1111-1111-1111-111111111111')
-            ),
-            p3 as (
-                insert into live_specs (catalog_name, spec_type, spec) values
-                -- Existing capture which is deeply merged.
-                ('aliceCo/dir/source-thingy', 'capture', '{
-                    "bindings": [ ],
-                    "endpoint": { "connector": { "config": { "a": "oldA" }, "image": "an/image" } },
-                    "interval": "10m"
-                }')
-            )
-            select 1;
-            "#,
-        )
-        .execute(&mut txn)
-        .await
-        .unwrap();
-
-        let response : capture::Response = serde_json::from_value(json!({
-            "discovered": {
-                "bindings": [
-                    {"documentSchema": {"const": "write!"}, "key": ["/foo"], "recommendedName": "foo", "resourceConfig": {"table": "foo"}},
-                    {"documentSchema": {"const": "bar"}, "key": ["/bar"], "recommendedName": "bar", "resourceConfig": {"table": "bar"}},
-                    {"documentSchema": {"const": "quz"}, "key": ["/quz"], "recommendedName": "quz", "resourceConfig": {"table": "quz"}},
-                ],
-            }
-        })).unwrap();
-
-        let endpoint_config = serde_json::value::to_raw_value(&json!({"a": "newA"})).unwrap();
-
-        let result = super::DiscoverHandler::build_merged_catalog(
-            "aliceCo/dir/source-thingy",
-            response,
-            Id::from_hex("eeeeeeeeeeeeeeee").unwrap(),
-            &endpoint_config,
-            "ghcr.io/estuary/source-thingy",
-            ":v1",
-            false,
-            true,
-            Uuid::from_str("11111111-1111-1111-1111-111111111111").unwrap(),
-            &mut txn,
-        )
-        .await;
-
-        let errs = result
-            .unwrap()
-            .expect_err("expected inner result to be an error");
-        assert_eq!(1, errs.len());
-        assert_eq!(
-            "capture endpoint has been modified since the discover was created (will retry)",
-            &errs[0].detail
-        );
-    }
-
-    #[tokio::test]
-    async fn test_catalog_merge_bad_spec() {
-        let mut conn = sqlx::postgres::PgConnection::connect(&FIXED_DATABASE_URL)
-            .await
-            .unwrap();
-        let mut txn = conn.begin().await.unwrap();
-
-        sqlx::query(
-            r#"
-            with
-            p1 as (
-                insert into drafts (id, user_id) values
-                ('dddddddddddddddd', '11111111-1111-1111-1111-111111111111')
-            ),
-            p2 as (
-                insert into draft_specs (draft_id, catalog_name, spec_type, spec) values
-                ('dddddddddddddddd', 'aliceCo/bad', 'collection', '{"key": "invalid"}')
-            )
-            select 1;
-            "#,
-        )
-        .execute(&mut txn)
-        .await
-        .unwrap();
-
-        let response : capture::Response = serde_json::from_value(json!({
-            "discovered": {
-                "bindings": [
-                    {"documentSchema": {"const": 42}, "key": ["/key"], "recommendedName": "bad", "resourceConfig": {"table": "bad"}},
-                ],
-            }
-        })).unwrap();
-
-        let result = super::DiscoverHandler::build_merged_catalog(
-            "aliceCo/source-thingy",
-            response,
-            Id::from_hex("dddddddddddddddd").unwrap(),
-            &serde_json::value::to_raw_value(&json!({"some": "endpoint-config"})).unwrap(),
-            "ghcr.io/estuary/source-thingy",
-            ":v1",
-            false,
-            false,
-            Uuid::from_str("11111111-1111-1111-1111-111111111111").unwrap(),
-            &mut txn,
-        )
-        .await;
-
-        let errors = result.unwrap().unwrap_err();
-        insta::assert_debug_snapshot!(errors, @r###"
-        [
-            Error {
-                catalog_name: "aliceCo/bad",
-                scope: None,
-                detail: "parsing collection aliceCo/bad: invalid type: string \"invalid\", expected a sequence at line 1 column 17",
-            },
-        ]
-        "###);
-    }
-    */
 }

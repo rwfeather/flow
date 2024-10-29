@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use tables::DraftCollection;
 
-pub fn new_parse_response(response: capture::Response) -> anyhow::Result<Vec<Binding>> {
+pub fn parse_response(response: capture::Response) -> anyhow::Result<Vec<Binding>> {
     let capture::Response {
         discovered: Some(capture::response::Discovered { mut bindings }),
         ..
@@ -197,7 +197,7 @@ pub fn update_capture_bindings(
     Ok((used_bindings, added_resources, removed_resources))
 }
 
-pub fn new_merge_collections(
+pub fn merge_collections(
     used_bindings: Vec<UsedBinding>,
     draft: &mut tables::DraftCollections,
     live: &tables::LiveCollections,
@@ -214,6 +214,11 @@ pub fn new_merge_collections(
 
         let draft_target = draft.get_or_insert_with(&target, || {
             if let Some(live_collection) = live.get_by_key(&target) {
+                tracing::debug!(
+                    ?target,
+                    ?resource_path,
+                    "adding new draft collection from live specs"
+                );
                 tables::DraftCollection {
                     collection: live_collection.collection.clone(),
                     scope: tables::synthetic_scope(models::CatalogType::Collection, &target),
@@ -222,6 +227,7 @@ pub fn new_merge_collections(
                     is_touch: true, // we might negate this later if we modify
                 }
             } else {
+                tracing::debug!(?target, ?resource_path, "creating new draft collection");
                 let model = models::CollectionDef {
                     schema: None,
                     write_schema: None,
@@ -251,6 +257,7 @@ pub fn new_merge_collections(
         } = draft_target;
 
         let Some(draft_model) = model.as_mut() else {
+            // TODO: This should arguably be an error
             tracing::warn!(
                 %target,
                 "skipping merge of discovered target collection that is deleted in the draft"
@@ -271,16 +278,27 @@ pub fn new_merge_collections(
             }
         }
 
-        let base_schema: &mut Option<models::Schema> =
-            if draft_model.read_schema.is_some() || uses_inferred_schema(&document_schema) {
-                &mut draft_model.read_schema
-            } else {
-                &mut draft_model.schema
-            };
-        if is_schema_changed(&document_schema, base_schema.as_ref()) {
+        let mut modified = false;
+        if draft_model.read_schema.is_some() {
+            if is_schema_changed(&document_schema, draft_model.write_schema.as_ref()) {
+                modified = true;
+                draft_model.write_schema = Some(document_schema);
+            }
+        } else if uses_inferred_schema(&document_schema) {
+            // This is either a new collection, or else discovery has just started asking for
+            // the inferred schema. In either case, we must initialize the read schema with the
+            // inferred schema placeholder.
+            modified = true;
+            draft_model.read_schema = Some(models::Schema::default_inferred_read_schema());
+            draft_model.write_schema = Some(document_schema);
+            draft_model.schema = None;
+        } else if is_schema_changed(&document_schema, draft_model.schema.as_ref()) {
+            modified = true;
+            draft_model.schema = Some(document_schema);
+        }
+        if modified {
             *is_touch = false;
             modified_collections.insert(resource_path, collection.clone());
-            *base_schema = Some(document_schema);
         }
     }
     Ok(modified_collections)
@@ -317,6 +335,7 @@ mod tests {
     use super::*;
     use proto_flow::capture::{self, response::discovered};
     use serde_json::json;
+    use tables::DraftRow;
 
     #[test]
     fn test_response_parsing() {
@@ -360,7 +379,7 @@ mod tests {
         }))
         .unwrap();
 
-        let out = super::new_parse_response(response).unwrap();
+        let out = super::parse_response(response).unwrap();
 
         insta::assert_json_snapshot!(json!(out));
     }
@@ -427,23 +446,18 @@ mod tests {
             },
             // case/6: The fetched collection did not use schema inference, but now does.
             UsedBinding {
-                target: models::Collection::new("case/5"),
+                target: models::Collection::new("case/6"),
                 document_schema: models::Schema::new(
                     models::RawValue::from_str(r#"{ "const": "write!", "x-infer-schema": true }"#)
                         .unwrap(),
                 ),
                 key: string_vec(&["/key"]),
-                resource_path: string_vec(&["5"]),
+                resource_path: string_vec(&["6"]),
             },
         ];
 
-        /*
-        let (discovered_bindings, fetched_collections, targets): (
-            Vec<Binding>,
-            BTreeMap<models::Collection, models::CollectionDef>,
-            Vec<models::Collection>,
-        ) = serde_json::from_value(json!([
-            {
+        let draft_catalog: models::Catalog = serde_json::from_value(json!({
+            "collections": {
                 "case/2": {
                     "schema": false,
                     "key": ["/old"],
@@ -463,26 +477,91 @@ mod tests {
                     "readSchema": {"const": "read!"},
                     "key": ["/old"],
                 },
-                "case/6": {
-                    "schema": false,
-                    "key": ["/old"],
-                },
-            },
-            [
-                "case/1",
-                "case/2",
-                "case/3",
-                "case/4",
-                "case/5",
-                "case/6",
-            ]
-        ]))
+            }
+        }))
         .unwrap();
+        let mut draft = tables::DraftCatalog::from(draft_catalog);
 
-        let out = super::merge_collections(discovered_bindings, fetched_collections, targets);
+        let mut live = tables::LiveCatalog::default();
+        live.collections.insert(tables::LiveCollection {
+            collection: models::Collection::new("case/3"),
+            control_id: models::Id::zero(),
+            data_plane_id: models::Id::zero(),
+            last_pub_id: models::Id::zero(),
+            last_build_id: models::Id::zero(),
+            model: serde_json::from_value(json!({
+                "schema": false,
+                "key": ["/drafted-key-should-be-used-instead"],
+            }))
+            .unwrap(),
+            spec: Default::default(),
+            dependency_hash: None,
+        });
+        live.collections.insert(tables::LiveCollection {
+            collection: models::Collection::new("case/6"),
+            control_id: models::Id::zero(),
+            data_plane_id: models::Id::zero(),
+            last_pub_id: models::Id::zero(),
+            last_build_id: models::Id::zero(),
+            model: serde_json::from_value(json!({
+                "schema": false,
+                "key": ["/old"],
+            }))
+            .unwrap(),
+            spec: Default::default(),
+            dependency_hash: None,
+        });
 
-        insta::assert_snapshot!(serde_json::to_string_pretty(&out).unwrap());
-        */
+        let modified = super::merge_collections(
+            discovered_bindings,
+            &mut draft.collections,
+            &live.collections,
+        );
+
+        insta::assert_debug_snapshot!(modified, @r###"
+        Ok(
+            {
+                [
+                    "1",
+                ]: Collection(
+                    "case/1",
+                ),
+                [
+                    "2",
+                ]: Collection(
+                    "case/2",
+                ),
+                [
+                    "3",
+                ]: Collection(
+                    "case/3",
+                ),
+                [
+                    "4",
+                ]: Collection(
+                    "case/4",
+                ),
+                [
+                    "5",
+                ]: Collection(
+                    "case/5",
+                ),
+                [
+                    "6",
+                ]: Collection(
+                    "case/6",
+                ),
+            },
+        )
+        "###);
+
+        let case6 = draft
+            .collections
+            .get_by_key(&models::Collection::new("case/6"))
+            .unwrap();
+        assert!(case6.model().unwrap().schema.is_none());
+        assert!(case6.model().unwrap().read_schema.is_some());
+        assert!(case6.model().unwrap().write_schema.is_some());
     }
 
     #[test]
@@ -510,7 +589,7 @@ mod tests {
                     { "resource": { "stream": "removed" }, "target": "acmeCo/discarded" },
                     { "resource": { "stream": "disabled", "modified": "yup" }, "disable": true, "target": "test/collection/disabled" },
                   ],
-                  "endpoint": { "connector": { "config": { "fetched": 1 }, "image": "old/image" } },
+                  "endpoint": { "connector": { "config": { "fetched": 1 }, "image": "an/image" } },
                   // Extra fields which are passed-through.
                   "interval": "34s",
                   "shards": {
@@ -536,8 +615,8 @@ mod tests {
         // * Updated the endpoint configuration.
         // * Preserved unrelated fields of the capture (shard template and interval).
         // * The resources that specify a namespace are treated separately
-        insta::assert_debug_snapshot!(out);
         insta::assert_json_snapshot!(fetched_capture);
+        insta::assert_debug_snapshot!(out);
     }
 
     #[test]
@@ -567,6 +646,33 @@ mod tests {
         .unwrap();
 
         insta::assert_debug_snapshot!(path_merge_out);
+        insta::assert_json_snapshot!(model, @r###"
+        {
+          "endpoint": {
+            "connector": {
+              "image": "new/image",
+              "config": {
+                "$serde_json::private::RawValue": "{\"discovered\":1}"
+              }
+            }
+          },
+          "bindings": [
+            {
+              "resource": {
+                "$serde_json::private::RawValue": "{\"stream\":\"foo\"}"
+              },
+              "target": "acmeCo/my/foo"
+            },
+            {
+              "resource": {
+                "$serde_json::private::RawValue": "{\"stream\":\"bar\"}"
+              },
+              "disable": true,
+              "target": "acmeCo/my/bar"
+            }
+          ]
+        }
+        "###);
     }
 
     #[test]
@@ -577,9 +683,9 @@ mod tests {
         let (discovered_bindings, mut fetched_capture) =
             serde_json::from_value::<(Vec<discovered::Binding>, models::CaptureDef)>(json!([
                 [
-                    { "recommendedName": "suggested", "resourceConfig": { "stream": "foo" }, "documentSchema": { "const": "discovered" } },
-                    { "recommendedName": "other", "resourceConfig": { "stream": "bar" }, "documentSchema": false },
-                    { "recommendedName": "other", "resourceConfig": { "stream": "disabled" }, "documentSchema": false },
+                    { "recommendedName": "fooName", "resourceConfig": { "stream": "foo" }, "documentSchema": { "const": "discovered" } },
+                    { "recommendedName": "barName", "resourceConfig": { "stream": "bar" }, "documentSchema": false },
+                    { "recommendedName": "disabledName", "resourceConfig": { "stream": "disabled" }, "documentSchema": false },
                 ],
                 {
                   "bindings": [
