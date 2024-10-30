@@ -5,14 +5,15 @@ use models::CatalogType;
 use proto_flow::AnyBuiltSpec;
 use serde_json::value::RawValue;
 use sqlx::types::Uuid;
-use std::{collections::BTreeSet, ops::Deref};
+use std::collections::BTreeSet;
 
 use crate::{
     discovers::{Discover, DiscoverOutput},
     publications::{
-        DefaultRetryPolicy, DraftPublication, JobStatus, NoExpansion, NoopFinalize,
-        PublicationResult, Publisher, UpdateInferredSchemas,
+        DefaultRetryPolicy, DraftPublication, NoopFinalize, PublicationResult, Publisher,
+        UpdateInferredSchemas,
     },
+    Connectors, DiscoverHandler,
 };
 
 macro_rules! unwrap_single {
@@ -150,25 +151,28 @@ fn set_of<T: Into<String>>(s: T) -> BTreeSet<String> {
 
 /// Implementation of `ControlPlane` that connects directly to postgres.
 #[derive(Clone)]
-pub struct PGControlPlane {
+pub struct PGControlPlane<C: Connectors> {
     pub pool: sqlx::PgPool,
     pub system_user_id: Uuid,
     pub publications_handler: Publisher,
     pub id_generator: models::IdGenerator,
+    pub discovers_handler: DiscoverHandler<C>,
 }
 
-impl PGControlPlane {
+impl<C: Connectors> PGControlPlane<C> {
     pub fn new(
         pool: sqlx::PgPool,
         system_user_id: Uuid,
         publications_handler: Publisher,
         id_generator: models::IdGenerator,
+        discovers_handler: DiscoverHandler<C>,
     ) -> Self {
         Self {
             pool,
             system_user_id,
             publications_handler,
             id_generator,
+            discovers_handler,
         }
     }
 
@@ -235,7 +239,7 @@ impl PGControlPlane {
 }
 
 #[async_trait::async_trait]
-impl ControlPlane for PGControlPlane {
+impl<C: Connectors> ControlPlane for PGControlPlane<C> {
     #[tracing::instrument(level = "debug", err, skip(self))]
     async fn notify_dependents(&mut self, catalog_name: String) -> anyhow::Result<()> {
         let now = self.current_time();
@@ -331,7 +335,12 @@ impl ControlPlane for PGControlPlane {
     }
 
     async fn discover(&mut self, req: Discover) -> anyhow::Result<DiscoverOutput> {
-        todo!()
+        let PGControlPlane {
+            pool,
+            discovers_handler,
+            ..
+        } = self;
+        discovers_handler.discover(pool, req).await
     }
 
     async fn publish(

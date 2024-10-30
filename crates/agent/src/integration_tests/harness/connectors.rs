@@ -1,6 +1,7 @@
 use crate::proxy_connectors::Connectors;
 use proto_flow::capture;
 use std::fmt::Debug;
+use std::sync::{Arc, Mutex};
 
 pub trait MockCall<Req, Resp>: Send + Sync + 'static {
     fn call(
@@ -46,14 +47,15 @@ where
 pub type MockDiscover =
     Box<dyn MockCall<capture::request::Discover, capture::response::Discovered>>;
 
+#[derive(Clone)]
 pub struct MockConnectors {
-    discover: MockDiscover,
+    discover: Arc<Mutex<MockDiscover>>,
 }
 
 impl Default for MockConnectors {
     fn default() -> Self {
         MockConnectors {
-            discover: Box::new(DefaultFail),
+            discover: Arc::new(Mutex::new(Box::new(DefaultFail))),
         }
     }
 }
@@ -64,7 +66,8 @@ impl MockConnectors {
     }
 
     pub fn mock_discover(&mut self, respond: MockDiscover) {
-        self.discover = respond;
+        let mut lock = self.discover.lock().unwrap();
+        *lock = respond;
     }
 }
 
@@ -77,8 +80,8 @@ impl Connectors for MockConnectors {
         data_plane: &'a tables::DataPlane,
     ) -> anyhow::Result<capture::Response> {
         if let Some(discover) = req.discover.take() {
-            return self
-                .discover
+            let locked = self.discover.lock().unwrap();
+            return locked
                 .call(discover, logs_token, task, data_plane)
                 .map(|resp| capture::Response {
                     discovered: Some(resp),

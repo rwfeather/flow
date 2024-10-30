@@ -6,7 +6,7 @@ use std::future::Future;
 use uuid::Uuid;
 
 /// Trait for performing unary connector RPCs from the control plane, which handles logging.
-pub trait Connectors: Send + Sync + 'static {
+pub trait Connectors: Clone + Send + Sync + 'static {
     fn unary_capture<'a>(
         &'a self,
         req: capture::Request,

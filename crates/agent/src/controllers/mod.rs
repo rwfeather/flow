@@ -42,6 +42,8 @@ pub struct ControllerState {
     pub next_run: Option<DateTime<Utc>>,
     /// The last update time of the controller.
     pub updated_at: DateTime<Utc>,
+    /// The creation time of the live spec
+    pub created_at: DateTime<Utc>,
     /// The number of consecutive failures from previous controller runs. This
     /// gets reset to 0 after any successful controller run.
     pub failures: i32,
@@ -133,6 +135,7 @@ impl ControllerState {
         let controller_state = ControllerState {
             next_run: job.controller_next_run,
             updated_at: job.updated_at,
+            created_at: job.created_at,
             live_spec,
             built_spec,
             failures: job.failures,
@@ -465,6 +468,15 @@ mod test {
     };
     use crate::draft::Error;
     use crate::publications::{AffectedConsumer, IncompatibleCollection, JobStatus, RejectedField};
+
+    #[test]
+    fn test_next_run_with_zero() {
+        let sub = NextRun::after_minutes(0)
+            .with_jitter_percent(20)
+            .compute_time();
+        let now = Utc::now();
+        assert!(now.signed_duration_since(sub).abs() < chrono::TimeDelta::milliseconds(10));
+    }
 
     #[test]
     fn test_status_round_trip_serde() {

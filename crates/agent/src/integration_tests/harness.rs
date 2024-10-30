@@ -163,6 +163,7 @@ impl TestHarness {
             system_user_id,
             publisher.clone(),
             id_gen.clone(),
+            discover_handler,
         );
         let controllers = ControllerHandler::new(TestControlPlane::new(control_plane));
         let mut harness = Self {
@@ -627,6 +628,7 @@ impl TestHarness {
                 ls.built_spec as "built_spec: TextJson<Box<RawValue>>",
                 ls.spec_type as "spec_type: agent_sql::CatalogType",
                 ls.dependency_hash as "live_dependency_hash",
+                ls.created_at,
                 cj.controller_version as "controller_version: i32",
                 cj.updated_at,
                 cj.logs_token,
@@ -991,6 +993,10 @@ impl TestHarness {
         .execute(&self.pool)
         .await
         .expect("failed to update inferred schema");
+    }
+
+    pub async fn run_next_auto_discover(&mut self, capture_name: &str) {
+        todo!()
     }
 }
 

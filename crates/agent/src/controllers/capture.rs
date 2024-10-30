@@ -1,10 +1,14 @@
+use std::{collections::BTreeMap, time::Duration};
+
 use super::{
     backoff_data_plane_activate,
     publication_status::{ActivationStatus, PendingPublication},
     ControlPlane, ControllerErrorExt, ControllerState, NextRun,
 };
-use crate::controllers::publication_status::PublicationStatus;
+use crate::discovers::Changes;
+use crate::{controllers::publication_status::PublicationStatus, publications};
 use anyhow::Context;
+use chrono::{DateTime, Utc};
 use itertools::Itertools;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -20,6 +24,8 @@ pub struct CaptureStatus {
     pub publications: PublicationStatus,
     #[serde(default)]
     pub activation: ActivationStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_discovers: Option<AutoDiscoverStatus>,
 }
 
 impl CaptureStatus {
@@ -27,7 +33,7 @@ impl CaptureStatus {
         &mut self,
         state: &ControllerState,
         control_plane: &mut C,
-        _model: &models::CaptureDef,
+        model: &models::CaptureDef,
     ) -> anyhow::Result<Option<NextRun>> {
         let mut pending_pub = PendingPublication::new();
         let dependencies = self
@@ -62,7 +68,16 @@ impl CaptureStatus {
             }
         }
 
-        // TODO: implement auto discover here
+        let ad_next_run = if model.auto_discover.is_some() {
+            let ad_status = self.auto_discovers.get_or_insert_with(Default::default);
+            let next_auto_discover = ad_status
+                .update(state, control_plane, model, &mut pending_pub)
+                .await
+                .context("updating auto-discover")?;
+            Some(next_auto_discover)
+        } else {
+            None
+        };
 
         if pending_pub.has_pending() {
             let _result = pending_pub
@@ -86,6 +101,82 @@ impl CaptureStatus {
 
         Ok(None)
     }
+}
+
+pub type ReCreatedCollections = BTreeMap<models::Collection, models::Collection>;
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, JsonSchema, Clone)]
+pub struct AutoDiscoverOutcome {
+    #[schemars(schema_with = "super::datetime_schema")]
+    pub ts: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Changes::is_empty")]
+    pub added: Changes,
+    #[serde(default, skip_serializing_if = "Changes::is_empty")]
+    pub modified: Changes,
+    #[serde(default, skip_serializing_if = "Changes::is_empty")]
+    pub removed: Changes,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<crate::draft::Error>,
+    #[serde(default, skip_serializing_if = "ReCreatedCollections::is_empty")]
+    pub re_created_collections: ReCreatedCollections,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_result: Option<publications::JobStatus>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, JsonSchema, Clone)]
+pub struct AutoDiscoverFailure {
+    pub count: usize,
+    #[schemars(schema_with = "super::datetime_schema")]
+    pub first_ts: DateTime<Utc>,
+    pub last_oucome: AutoDiscoverOutcome,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, JsonSchema)]
+pub struct AutoDiscoverStatus {
+    #[serde(default, with = "humantime_serde")]
+    #[schemars(schema_with = "interval_schema")]
+    pub interval: Option<Duration>,
+    pub pending_publish: Option<AutoDiscoverOutcome>,
+    pub last_success: Option<AutoDiscoverOutcome>,
+    pub failure: Option<AutoDiscoverFailure>,
+}
+
+fn interval_schema(_: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+    serde_json::from_value(serde_json::json!({
+        "type": ["string", "null"],
+        "pattern": "^\\d+(s|m|h)$"
+    }))
+    .unwrap()
+}
+
+impl AutoDiscoverStatus {
+    /// Default to running auto-discovers every 2 hours
+    const DEFAULT_INTERVAL: Duration = Duration::from_secs(60 * 60 * 2);
+
+    async fn update<C: ControlPlane>(
+        &mut self,
+        state: &ControllerState,
+        control_plane: &mut C,
+        model: &models::CaptureDef,
+        pending: &mut PendingPublication,
+    ) -> anyhow::Result<NextRun> {
+        let last_disco_time = self
+            .last_success
+            .as_ref()
+            .map(|s| s.ts)
+            .unwrap_or(state.created_at);
+        let backoff_minutes = self.failure.as_ref().map(|fail| match fail.count {
+            0 => 0,
+            1 => 15,
+            n @ 2..=4 => n * 30,
+            n @ 5.. => n.min(23) * 60,
+        });
+        //NextRun::after_minutes(backoff_minutes).with_jitter_percent(20)
+
+        todo!()
+    }
+
+    // async fn publication_finished()
 }
 
 fn backoff_publication_failure(prev_failures: i32) -> Option<NextRun> {

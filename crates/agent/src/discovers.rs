@@ -116,6 +116,7 @@ impl DiscoverOutput {
 //        - Add resource path to changes if so
 
 /// A DiscoverHandler is a Handler which performs discovery operations.
+#[derive(Clone)]
 pub struct DiscoverHandler<C> {
     pub connectors: C,
 }
