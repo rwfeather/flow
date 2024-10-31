@@ -22,6 +22,8 @@ use sqlx::types::Uuid;
 use tables::DraftRow;
 use tempfile::tempdir;
 
+use self::connectors::MockConnectors;
+
 const FIXED_DATABASE_URL: &str = "postgresql://postgres:postgres@localhost:5432/postgres";
 
 pub fn set_of(names: &[&str]) -> BTreeSet<String> {
@@ -163,7 +165,7 @@ impl TestHarness {
             system_user_id,
             publisher.clone(),
             id_gen.clone(),
-            discover_handler,
+            discover_handler.clone(),
         );
         let controllers = ControllerHandler::new(TestControlPlane::new(control_plane));
         let mut harness = Self {
@@ -1065,7 +1067,7 @@ impl FailBuild for InjectBuildError {
 /// A wrapper around `PGControlPlane` that has a few basic capbilities for verifying
 /// activation calls and simulating failures of activations and publications.
 pub struct TestControlPlane {
-    inner: PGControlPlane,
+    inner: PGControlPlane<MockConnectors>,
     activations: Vec<Activation>,
     fail_activations: BTreeSet<String>,
     build_failures: InjectBuildFailures,
@@ -1098,7 +1100,7 @@ impl crate::publications::FinalizeBuild for InjectBuildFailures {
 }
 
 impl TestControlPlane {
-    fn new(inner: PGControlPlane) -> Self {
+    fn new(inner: PGControlPlane<MockConnectors>) -> Self {
         Self {
             inner,
             activations: Vec::new(),

@@ -254,12 +254,26 @@ impl NextRun {
         }
     }
 
+    pub fn at(approx_when: DateTime<Utc>) -> NextRun {
+        let now = Utc::now();
+        let delta = approx_when - now;
+        // _Teeechnically_ this could be negative, but we'll just treat that as "run now"
+        let after_seconds = delta.min(chrono::TimeDelta::zero()).num_seconds() as u32;
+        NextRun {
+            after_seconds,
+            jitter_percent: NextRun::DEFAULT_JITTER,
+        }
+    }
+
     /// Returns an absolute time at which the next run should become due.
     /// Uses only millisecond precision to ensure that the timestamp can be losslessly
     /// round-tripped through postgres.
     pub fn compute_time(&self) -> DateTime<Utc> {
         use rand::Rng;
 
+        if self.after_seconds == 0 {
+            return Utc::now();
+        }
         let delta_millis = self.after_seconds as i64 * 1000;
         let jitter_mul = self.jitter_percent as f64 / 100.0;
         let jitter_max = (delta_millis as f64 * jitter_mul) as i64;

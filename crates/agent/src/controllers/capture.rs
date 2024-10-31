@@ -5,7 +5,7 @@ use super::{
     publication_status::{ActivationStatus, PendingPublication},
     ControlPlane, ControllerErrorExt, ControllerState, NextRun,
 };
-use crate::discovers::Changes;
+use crate::discovers::{Changes, Discover};
 use crate::{controllers::publication_status::PublicationStatus, publications};
 use anyhow::Context;
 use chrono::{DateTime, Utc};
@@ -25,7 +25,7 @@ pub struct CaptureStatus {
     #[serde(default)]
     pub activation: ActivationStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auto_discovers: Option<AutoDiscoverStatus>,
+    pub auto_discover: Option<AutoDiscoverStatus>,
 }
 
 impl CaptureStatus {
@@ -69,7 +69,7 @@ impl CaptureStatus {
         }
 
         let ad_next_run = if model.auto_discover.is_some() {
-            let ad_status = self.auto_discovers.get_or_insert_with(Default::default);
+            let ad_status = self.auto_discover.get_or_insert_with(Default::default);
             let next_auto_discover = ad_status
                 .update(state, control_plane, model, &mut pending_pub)
                 .await
@@ -160,20 +160,32 @@ impl AutoDiscoverStatus {
         model: &models::CaptureDef,
         pending: &mut PendingPublication,
     ) -> anyhow::Result<NextRun> {
-        let last_disco_time = self
-            .last_success
-            .as_ref()
-            .map(|s| s.ts)
-            .unwrap_or(state.created_at);
-        let backoff_minutes = self.failure.as_ref().map(|fail| match fail.count {
-            0 => 0,
-            1 => 15,
-            n @ 2..=4 => n * 30,
-            n @ 5.. => n.min(23) * 60,
-        });
-        //NextRun::after_minutes(backoff_minutes).with_jitter_percent(20)
+        let next_disco_time = self.next_discover_time(state);
+        if control_plane.current_time() <= next_disco_time {
+            return Ok(NextRun::at(next_disco_time));
+        }
 
         todo!()
+    }
+
+    fn next_discover_time(&self, state: &ControllerState) -> DateTime<Utc> {
+        if let Some(failure) = self.failure.as_ref() {
+            let backoff_minutes = match failure.count {
+                0 => 0, // just in case someone manually sets the failure count to 0
+                1 => 15,
+                n @ 2..=4 => n * 30,
+                n @ 5.. => n.min(23) * 60,
+            };
+            failure.last_oucome.ts + chrono::Duration::minutes(backoff_minutes)
+        } else {
+            let last_disco_time = self
+                .last_success
+                .as_ref()
+                .map(|s| s.ts)
+                .unwrap_or(state.created_at);
+            let interval = self.interval.unwrap_or(Self::DEFAULT_INTERVAL);
+            last_disco_time + interval
+        }
     }
 
     // async fn publication_finished()
