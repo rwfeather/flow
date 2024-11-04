@@ -254,11 +254,11 @@ impl NextRun {
         }
     }
 
-    pub fn at(approx_when: DateTime<Utc>) -> NextRun {
+    pub fn after(approx_when: DateTime<Utc>) -> NextRun {
         let now = Utc::now();
         let delta = approx_when - now;
         // _Teeechnically_ this could be negative, but we'll just treat that as "run now"
-        let after_seconds = delta.min(chrono::TimeDelta::zero()).num_seconds() as u32;
+        let after_seconds = delta.max(chrono::TimeDelta::zero()).num_seconds() as u32;
         NextRun {
             after_seconds,
             jitter_percent: NextRun::DEFAULT_JITTER,
@@ -484,12 +484,23 @@ mod test {
     use crate::publications::{AffectedConsumer, IncompatibleCollection, JobStatus, RejectedField};
 
     #[test]
-    fn test_next_run_with_zero() {
+    fn test_next_run_after() {
+        // Test with zero, to make sure that it doesn't panic.
         let sub = NextRun::after_minutes(0)
             .with_jitter_percent(20)
             .compute_time();
         let now = Utc::now();
         assert!(now.signed_duration_since(sub).abs() < chrono::TimeDelta::milliseconds(10));
+
+        let next = NextRun::after(now);
+        assert_eq!(0, next.after_seconds);
+        assert!(
+            next.with_jitter_percent(0)
+                .compute_time()
+                .signed_duration_since(now)
+                .abs()
+                < chrono::TimeDelta::milliseconds(10)
+        );
     }
 
     #[test]

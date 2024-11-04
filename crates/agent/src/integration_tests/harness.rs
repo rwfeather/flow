@@ -615,6 +615,20 @@ impl TestHarness {
         assert_eq!(0, live_specs.spec_count());
     }
 
+    pub async fn set_auto_discover_interval(&mut self, capture: &str, interval: &str) {
+        sqlx::query!(
+            r#"update controller_jobs
+            set status = jsonb_set(status::jsonb, '{ auto_discover, interval }', to_jsonb($2::text), true)::json
+            where live_spec_id = (select id from live_specs where catalog_name = $1)
+            returning 1 as "must_exist: bool";"#,
+            capture,
+            interval,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .expect("failed to update controller_jobs");
+    }
+
     /// Returns a `ControllerState` representing the given live spec and
     /// controller status from the perspective of a controller.
     pub async fn get_controller_state(&mut self, name: &str) -> ControllerState {
@@ -1186,8 +1200,17 @@ impl ControlPlane for TestControlPlane {
         self.inner.current_time()
     }
 
-    async fn discover(&mut self, discover: Discover) -> anyhow::Result<DiscoverOutput> {
-        todo!()
+    async fn discover(
+        &mut self,
+        capture_name: models::Capture,
+        draft: tables::DraftCatalog,
+        update_only: bool,
+        logs_token: Uuid,
+        data_plane_id: models::Id,
+    ) -> anyhow::Result<DiscoverOutput> {
+        self.inner
+            .discover(capture_name, draft, update_only, logs_token, data_plane_id)
+            .await
     }
 
     async fn publish(

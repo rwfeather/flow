@@ -22,6 +22,7 @@ pub enum JobStatus {
         specs_unchanged: bool,
     },
     DeprecatedBackground,
+    NoDataPlane,
 }
 
 impl JobStatus {
@@ -63,7 +64,7 @@ impl<C: Connectors> Handler for DiscoverHandler<C> {
 }
 
 impl<C: Connectors> DiscoverHandler<C> {
-    #[tracing::instrument(err, skip_all, fields(id=?row.id, draft_id = ?row.draft_id))]
+    #[tracing::instrument(err, skip_all, fields(id=?row.id, draft_id = ?row.draft_id, user_id = %row.user_id))]
     async fn process(
         &mut self,
         row: Row,
@@ -113,6 +114,18 @@ impl<C: Connectors> DiscoverHandler<C> {
             );
             return Ok((row.id, JobStatus::DeprecatedBackground));
         }
+        let mut data_planes: tables::DataPlanes = agent_sql::data_plane::fetch_data_planes(
+            pool,
+            Vec::new(),
+            row.data_plane_name.as_str(),
+            row.user_id,
+        )
+        .await?;
+
+        let Some(data_plane) = data_planes.pop().filter(|d| d.is_default) else {
+            tracing::warn!(data_plane_name = ?row.data_plane_name, "data-plane not found or user may not be authorized");
+            return Ok((row.id, JobStatus::NoDataPlane));
+        };
 
         let image_composed = format!("{}{}", row.image_name, row.image_tag);
         let disco = prepare_discover(
@@ -120,10 +133,10 @@ impl<C: Connectors> DiscoverHandler<C> {
             row.draft_id,
             models::Capture::new(&row.capture_name),
             row.endpoint_config.0.clone().into(),
-            row.data_plane_name.clone(),
             row.update_only,
             row.logs_token,
             image_composed,
+            data_plane,
             pool,
         )
         .await?;
@@ -165,10 +178,10 @@ async fn prepare_discover(
     draft_id: Id,
     capture_name: models::Capture,
     endpoint_config: models::RawValue,
-    data_plane_name: String,
     update_only: bool,
     logs_token: uuid::Uuid,
     image_composed: String,
+    data_plane: tables::DataPlane,
     pool: &sqlx::PgPool,
 ) -> anyhow::Result<Discover> {
     let mut draft = crate::draft::load_draft(draft_id, pool)
@@ -234,7 +247,7 @@ async fn prepare_discover(
     Ok(Discover {
         user_id,
         capture_name,
-        data_plane_name,
+        data_plane,
         draft,
         update_only,
         logs_token,
@@ -299,24 +312,34 @@ mod test {
         let endpoint_config = models::RawValue::from_str(r#"{"a": "discoversA"}"#).unwrap();
         let logs_token = Uuid::from_str("22222222-3333-4444-5555-666666666666").unwrap();
         let image_composed = String::from("discovers/image:tag");
-        let data_plane_name = String::from("test-data-plane");
+        let data_plane = tables::DataPlane {
+            control_id: Id::zero(),
+            data_plane_name: "test-data-plane".to_string(),
+            data_plane_fqdn: "data.plane.test".to_string(),
+            is_default: true,
+            hmac_keys: Vec::new(),
+            ops_logs_name: models::Collection::new("tha/logs"),
+            ops_stats_name: models::Collection::new("tha/stats"),
+            broker_address: "broker.test".to_string(),
+            reactor_address: "reactor.test".to_string(),
+        };
 
         let result = super::prepare_discover(
             user_id,
             draft_id,
             capture_name.clone(),
             endpoint_config,
-            data_plane_name.clone(),
             false, // !update_only
             logs_token,
             image_composed.clone(),
+            data_plane.clone(),
             &harness.pool,
         )
         .await
         .unwrap();
 
         assert_eq!(capture_name, result.capture_name);
-        assert_eq!(data_plane_name, result.data_plane_name);
+        assert_eq!(data_plane, result.data_plane);
         assert_eq!(logs_token, result.logs_token);
         assert_eq!(user_id, result.user_id);
         assert!(!result.update_only);

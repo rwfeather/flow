@@ -1,3 +1,5 @@
+use crate::discovers::Changed;
+
 use super::{Changes, ResourcePath};
 use anyhow::Context;
 use proto_flow::capture::{self, response::discovered::Binding};
@@ -118,6 +120,7 @@ pub struct UsedBinding {
     document_schema: models::Schema,
     key: Vec<String>,
     resource_path: ResourcePath,
+    disable: bool,
 }
 
 pub fn update_capture_bindings(
@@ -126,7 +129,11 @@ pub fn update_capture_bindings(
     discovered_bindings: Vec<Binding>,
     update_only: bool,
     resource_path_pointers: &[doc::Pointer],
-) -> anyhow::Result<(Vec<UsedBinding>, Changes, Changes)> {
+) -> anyhow::Result<(
+    Vec<UsedBinding>,
+    Changes,
+    BTreeMap<ResourcePath, models::Collection>,
+)> {
     assert!(
         !resource_path_pointers.is_empty(),
         "expected resource_path_pointers to be non-empty"
@@ -166,10 +173,17 @@ pub fn update_capture_bindings(
             existing.clone()
         } else {
             let target = models::Collection::new(format!("{capture_prefix}/{recommended_name}"));
-            added_resources.insert(resource_path.clone(), target.clone());
+            let disable = update_only || discovered_binding.disable;
+            added_resources.insert(
+                resource_path.clone(),
+                Changed {
+                    target: target.clone(),
+                    disable,
+                },
+            );
             models::CaptureBinding {
                 target,
-                disable: update_only || discovered_binding.disable,
+                disable,
                 resource: models::RawValue::from_value(&discovered_resource),
                 backfill: 0,
             }
@@ -183,6 +197,7 @@ pub fn update_capture_bindings(
             document_schema,
             key,
             resource_path,
+            disable: new_binding.disable,
         });
         next_bindings.push(new_binding);
     }
@@ -210,6 +225,7 @@ pub fn merge_collections(
             document_schema,
             key,
             resource_path,
+            disable,
         } = binding;
 
         let draft_target = draft.get_or_insert_with(&target, || {
@@ -272,8 +288,20 @@ pub fn merge_collections(
                 .map(models::JsonPointer::new)
                 .collect::<models::CompositeKey>();
             if discovered_key != draft_model.key {
+                tracing::debug!(
+                    %collection,
+                    ?discovered_key,
+                    model_key = ?draft_model.key,
+                    "discovered key change"
+                );
                 *is_touch = false;
-                modified_collections.insert(resource_path.clone(), collection.clone());
+                modified_collections.insert(
+                    resource_path.clone(),
+                    Changed {
+                        target: collection.clone(),
+                        disable,
+                    },
+                );
                 draft_model.key = discovered_key;
             }
         }
@@ -281,10 +309,18 @@ pub fn merge_collections(
         let mut modified = false;
         if draft_model.read_schema.is_some() {
             if is_schema_changed(&document_schema, draft_model.write_schema.as_ref()) {
+                tracing::debug!(
+                    %collection,
+                    "discovered writeSchema change"
+                );
                 modified = true;
                 draft_model.write_schema = Some(document_schema);
             }
         } else if uses_inferred_schema(&document_schema) {
+            tracing::debug!(
+                %collection,
+                "discovered new use of inferred schema, initializing readSchema with placeholder"
+            );
             // This is either a new collection, or else discovery has just started asking for
             // the inferred schema. In either case, we must initialize the read schema with the
             // inferred schema placeholder.
@@ -293,12 +329,22 @@ pub fn merge_collections(
             draft_model.write_schema = Some(document_schema);
             draft_model.schema = None;
         } else if is_schema_changed(&document_schema, draft_model.schema.as_ref()) {
+            tracing::debug!(
+                %collection,
+                "discovered schema change"
+            );
             modified = true;
             draft_model.schema = Some(document_schema);
         }
         if modified {
             *is_touch = false;
-            modified_collections.insert(resource_path, collection.clone());
+            modified_collections.insert(
+                resource_path,
+                Changed {
+                    target: collection.clone(),
+                    disable,
+                },
+            );
         }
     }
     Ok(modified_collections)
@@ -405,6 +451,7 @@ mod tests {
                 ),
                 key: string_vec(&["/foo", "/bar"]),
                 resource_path: string_vec(&["1"]),
+                disable: false,
             },
             // case/2: expect key and schema are updated, but other fields remain.
             UsedBinding {
@@ -414,6 +461,7 @@ mod tests {
                 ),
                 key: string_vec(&["/foo", "/bar"]),
                 resource_path: string_vec(&["2"]),
+                disable: false,
             },
             // case/3: If discovered key is empty, it doesn't replace the collection key.
             UsedBinding {
@@ -423,6 +471,7 @@ mod tests {
                 ),
                 key: Vec::new(),
                 resource_path: string_vec(&["3"]),
+                disable: false,
             },
             // case/4: If fetched collection has read & write schemas, only the write schema is updated.
             UsedBinding {
@@ -433,6 +482,7 @@ mod tests {
                 ),
                 key: string_vec(&["/foo", "/bar"]),
                 resource_path: string_vec(&["4"]),
+                disable: true,
             },
             // case/5: If there is no fetched collection but schema inference is used, an initial read schema is created.
             UsedBinding {
@@ -443,6 +493,7 @@ mod tests {
                 ),
                 key: string_vec(&["/key"]),
                 resource_path: string_vec(&["5"]),
+                disable: true,
             },
             // case/6: The fetched collection did not use schema inference, but now does.
             UsedBinding {
@@ -453,6 +504,7 @@ mod tests {
                 ),
                 key: string_vec(&["/key"]),
                 resource_path: string_vec(&["6"]),
+                disable: true,
             },
         ];
 

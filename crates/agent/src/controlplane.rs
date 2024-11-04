@@ -72,7 +72,14 @@ pub trait ControlPlane: Send {
     /// Triggers controller runs for all dependents of the given `catalog_name`.
     async fn notify_dependents(&mut self, catalog_name: String) -> anyhow::Result<()>;
 
-    async fn discover(&mut self, req: Discover) -> anyhow::Result<DiscoverOutput>;
+    async fn discover(
+        &mut self,
+        capture_name: models::Capture,
+        draft: tables::DraftCatalog,
+        update_only: bool,
+        logs_token: Uuid,
+        data_plane_id: models::Id,
+    ) -> anyhow::Result<DiscoverOutput>;
 
     /// Attempts to publish the given draft, returning a result that indicates
     /// whether it was successful. Returns an `Err` only if there was an error
@@ -334,12 +341,38 @@ impl<C: Connectors> ControlPlane for PGControlPlane<C> {
         Utc::now()
     }
 
-    async fn discover(&mut self, req: Discover) -> anyhow::Result<DiscoverOutput> {
+    async fn discover(
+        &mut self,
+        capture_name: models::Capture,
+        draft: tables::DraftCatalog,
+        update_only: bool,
+        logs_token: Uuid,
+        data_plane_id: models::Id,
+    ) -> anyhow::Result<DiscoverOutput> {
         let PGControlPlane {
-            pool,
+            ref pool,
             discovers_handler,
+            system_user_id,
             ..
         } = self;
+        let data_planes = agent_sql::data_plane::fetch_data_planes(
+            pool,
+            vec![data_plane_id],
+            "not-a-real-default",
+            *system_user_id,
+        )
+        .await?;
+        let Some(data_plane) = data_planes.into_iter().next() else {
+            anyhow::bail!("data plane '{data_plane_id}' not found");
+        };
+        let req = Discover {
+            user_id: *system_user_id,
+            capture_name,
+            draft,
+            update_only,
+            logs_token,
+            data_plane,
+        };
         discovers_handler.discover(pool, req).await
     }
 

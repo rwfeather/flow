@@ -5,8 +5,15 @@ use super::{
     publication_status::{ActivationStatus, PendingPublication},
     ControlPlane, ControllerErrorExt, ControllerState, NextRun,
 };
-use crate::discovers::{Changes, Discover};
-use crate::{controllers::publication_status::PublicationStatus, publications};
+use crate::{
+    controllers::publication_status::PublicationStatus,
+    discovers::{Changed, ResourcePath},
+    publications,
+};
+use crate::{
+    discovers::{Changes, Discover, DiscoverOutput},
+    publications::PublicationResult,
+};
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use itertools::Itertools;
@@ -80,10 +87,18 @@ impl CaptureStatus {
         };
 
         if pending_pub.has_pending() {
-            let _result = pending_pub
+            let mut pub_result = pending_pub
                 .finish(state, &mut self.publications, control_plane)
                 .await
-                .context("failed to execute publish")?
+                .context("failed to execute publish")?;
+
+            if let Some(auto_discovers) = self.auto_discover.as_mut() {
+                pub_result = auto_discovers
+                    .publication_finished(pub_result, state, control_plane, model)
+                    .await?;
+            }
+
+            pub_result
                 .error_for_status()
                 .with_maybe_retry(backoff_publication_failure(state.failures))?;
         } else {
@@ -99,7 +114,7 @@ impl CaptureStatus {
                 .context("failed to notify dependents")?;
         }
 
-        Ok(None)
+        Ok(ad_next_run)
     }
 }
 
@@ -109,12 +124,12 @@ pub type ReCreatedCollections = BTreeMap<models::Collection, models::Collection>
 pub struct AutoDiscoverOutcome {
     #[schemars(schema_with = "super::datetime_schema")]
     pub ts: DateTime<Utc>,
-    #[serde(default, skip_serializing_if = "Changes::is_empty")]
-    pub added: Changes,
-    #[serde(default, skip_serializing_if = "Changes::is_empty")]
-    pub modified: Changes,
-    #[serde(default, skip_serializing_if = "Changes::is_empty")]
-    pub removed: Changes,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub added: Vec<(ResourcePath, models::Collection)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modified: Vec<(ResourcePath, models::Collection)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed: Vec<(ResourcePath, models::Collection)>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<crate::draft::Error>,
     #[serde(default, skip_serializing_if = "ReCreatedCollections::is_empty")]
@@ -123,21 +138,77 @@ pub struct AutoDiscoverOutcome {
     pub publish_result: Option<publications::JobStatus>,
 }
 
+impl AutoDiscoverOutcome {
+    fn from_output(ts: DateTime<Utc>, output: DiscoverOutput) -> (Self, tables::DraftCatalog) {
+        let DiscoverOutput {
+            capture_name: _,
+            draft,
+            added,
+            modified,
+            removed,
+        } = output;
+
+        let errors = draft
+            .errors
+            .iter()
+            .map(crate::draft::Error::from_tables_error)
+            .collect();
+
+        let outcome = Self {
+            ts,
+            added: added
+                .into_iter()
+                .map(|(rp, change)| (rp, change.target))
+                .collect(),
+            modified: modified
+                .into_iter()
+                .map(|(rp, change)| (rp, change.target))
+                .collect(),
+            removed: removed.into_iter().collect(),
+            errors,
+            re_created_collections: Default::default(),
+            publish_result: None,
+        };
+        (outcome, draft)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, JsonSchema, Clone)]
 pub struct AutoDiscoverFailure {
-    pub count: usize,
+    /// The number of consecutive failures that have been observed.
+    pub count: u32,
+    /// The timestamp of the first failure in the current sequence.
     #[schemars(schema_with = "super::datetime_schema")]
     pub first_ts: DateTime<Utc>,
-    pub last_oucome: AutoDiscoverOutcome,
+    /// The discover outcome corresponding to the most recent failure. This will
+    /// be updated with the results of each retry until an auto-discover
+    /// succeeds.
+    pub last_outcome: AutoDiscoverOutcome,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, JsonSchema)]
 pub struct AutoDiscoverStatus {
-    #[serde(default, with = "humantime_serde")]
+    /// The interval at which auto-discovery is run. This is normally unset, which uses
+    /// the default interval.
+    #[serde(
+        default,
+        with = "humantime_serde",
+        skip_serializing_if = "Option::is_none"
+    )]
     #[schemars(schema_with = "interval_schema")]
     pub interval: Option<Duration>,
+    /// The outcome of the a recent discover, which is about to be published.
+    /// This will typically only be observed if the publication failed for some
+    /// reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_publish: Option<AutoDiscoverOutcome>,
+    /// The outcome of the last _successful_ auto-discover. If `failure` is set,
+    /// then that will typically be more recent than `last_success`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_success: Option<AutoDiscoverOutcome>,
+    /// If auto-discovery has failed, this will include information about that failure.
+    /// This field is cleared as soon as a successful auto-discover is run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<AutoDiscoverFailure>,
 }
 
@@ -162,29 +233,170 @@ impl AutoDiscoverStatus {
     ) -> anyhow::Result<NextRun> {
         let next_disco_time = self.next_discover_time(state);
         if control_plane.current_time() <= next_disco_time {
-            return Ok(NextRun::at(next_disco_time));
+            return Ok(NextRun::after(next_disco_time));
+        }
+        // Time to discover. Start by clearing out any pending publish, since we'll use the outcome
+        // of the discover to determine that.
+        self.pending_publish = None;
+        let update_only = !model.auto_discover.as_ref().unwrap().add_new_bindings;
+        let capture_name = models::Capture::new(&state.catalog_name);
+
+        let mut draft = std::mem::take(&mut pending.draft);
+        if !draft.captures.get_by_key(&capture_name).is_some() {
+            draft.captures.insert(tables::DraftCapture {
+                capture: capture_name.clone(),
+                scope: tables::synthetic_scope(models::CatalogType::Capture, &capture_name),
+                expect_pub_id: Some(state.last_pub_id),
+                model: Some(model.clone()),
+                // start with a touch. The discover merge will set this to false if it actually updates the capture
+                is_touch: true,
+            });
         }
 
-        todo!()
+        let mut output = control_plane
+            .discover(
+                models::Capture::new(&state.catalog_name),
+                draft,
+                update_only,
+                state.logs_token,
+                state.data_plane_id,
+            )
+            .await
+            .context("failed to discover")?;
+
+        // Return early if there was a discover error.
+        if !output.is_success() {
+            let (outcome, _) =
+                AutoDiscoverOutcome::from_output(control_plane.current_time(), output);
+            if let Some(failure) = self.failure.as_mut() {
+                failure.count += 1;
+                failure.last_outcome = outcome;
+            } else {
+                self.failure = Some(AutoDiscoverFailure {
+                    count: 1,
+                    first_ts: control_plane.current_time(),
+                    last_outcome: outcome,
+                });
+            }
+            let retry_at = self.next_discover_time(state);
+            return Ok(NextRun::after(retry_at));
+        }
+
+        // The discover was successful, but has anything actually changed?
+        // First prune the discovered draft to remove any unchanged specs.
+        let unchanged_count = output.prune_unchanged_specs();
+        if output.is_unchanged() {
+            let (outcome, _) =
+                AutoDiscoverOutcome::from_output(control_plane.current_time(), output);
+            self.failure = None; // Clear any previous failure.
+            self.last_success = Some(outcome);
+            return Ok(NextRun::after(self.next_discover_time(state)));
+        }
+
+        let (outcome, draft) =
+            AutoDiscoverOutcome::from_output(control_plane.current_time(), output);
+
+        debug_assert!(
+            draft.spec_count() > 0,
+            "draft should have at least one spec since is_unchanged() returned false"
+        );
+
+        // Try to publish the changes
+        tracing::info!(
+            %unchanged_count,
+            drafted_count = %draft.spec_count(),
+            added = %outcome.added.len(),
+            modified = %outcome.modified.len(),
+            removed = %outcome.removed.len(),
+            "Auto-discover has changes to publish"
+        );
+
+        let publish_detail = format!(
+            "auto-discover changes ({} added, {} modified, {} removed)",
+            outcome.added.len(),
+            outcome.modified.len(),
+            outcome.removed.len(),
+        );
+        pending.details.push(publish_detail);
+        // Add the draft back into the pending publication, so it will be published.
+        pending.draft = draft;
+
+        self.pending_publish = Some(outcome);
+
+        Ok(NextRun::after(self.next_discover_time(state)))
+    }
+
+    async fn publication_finished<C: ControlPlane>(
+        &mut self,
+        mut result: PublicationResult,
+        state: &ControllerState,
+        control_plane: &mut C,
+        model: &models::CaptureDef,
+    ) -> anyhow::Result<PublicationResult> {
+        let Some(mut pending_outcome) = self.pending_publish.take() else {
+            // Nothing to do if we didn't attempt to publish. This just means that the publication
+            // was due to dependency updates, not auto-discover.
+            return Ok(result);
+        };
+
+        // Did the publication result in incompatible collections, which we should evolve?
+        let evolve_incompatible = model
+            .auto_discover
+            .as_ref()
+            .unwrap()
+            .evolve_incompatible_collections;
+        if evolve_incompatible && result.status.has_incompatible_collections() {
+            tracing::error!("oh no incompatible collections!");
+            anyhow::bail!("incompatible collections, oh nooooo");
+            // todo!("implement evolve incompatible collections and retry publish");
+        }
+
+        pending_outcome.publish_result = Some(result.status.clone());
+
+        if result.status.is_success() || result.status.is_empty_draft() {
+            self.failure = None;
+            self.last_success = Some(pending_outcome);
+        } else {
+            if let Some(fail) = self.failure.as_mut() {
+                fail.count += 1;
+                fail.last_outcome = pending_outcome;
+            } else {
+                self.failure = Some(AutoDiscoverFailure {
+                    count: 1,
+                    first_ts: pending_outcome.ts,
+                    last_outcome: pending_outcome,
+                });
+            }
+        }
+
+        return Ok(result);
     }
 
     fn next_discover_time(&self, state: &ControllerState) -> DateTime<Utc> {
+        let interval = self.interval.unwrap_or(Self::DEFAULT_INTERVAL);
         if let Some(failure) = self.failure.as_ref() {
-            let backoff_minutes = match failure.count {
+            // We scale the backoff multiplier based on the configured interval
+            // here. This is both to keep the backoffs reasonable, and to allow
+            // us to test multiple failure scenarios in integration tests.
+            let backoff_secs = match failure.count as u64 {
                 0 => 0, // just in case someone manually sets the failure count to 0
-                1 => 15,
-                n @ 2..=4 => n * 30,
-                n @ 5.. => n.min(23) * 60,
+                1 => interval.as_secs() / 8,
+                n @ 2..=4 => n * (interval.as_secs() / 4),
+                n @ 5.. => n.min(23) * (interval.as_secs() / 2),
             };
-            failure.last_oucome.ts + chrono::Duration::minutes(backoff_minutes)
+            tracing::info!( %backoff_secs, "Auto-discover will retry after backoff");
+            failure.last_outcome.ts + chrono::Duration::seconds(backoff_secs as i64)
         } else {
             let last_disco_time = self
-                .last_success
+                .pending_publish
                 .as_ref()
                 .map(|s| s.ts)
+                .or_else(|| self.last_success.as_ref().map(|p| p.ts))
                 .unwrap_or(state.created_at);
-            let interval = self.interval.unwrap_or(Self::DEFAULT_INTERVAL);
-            last_disco_time + interval
+
+            let next = last_disco_time + interval;
+            tracing::info!(%last_disco_time, ?interval, %next, "determined next auto-discover run time");
+            next
         }
     }
 

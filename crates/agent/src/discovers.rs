@@ -19,7 +19,7 @@ mod specs;
 /// those in the `base_model`.
 pub struct Discover {
     pub capture_name: models::Capture,
-    pub data_plane_name: String,
+    pub data_plane: tables::DataPlane,
     pub logs_token: Uuid,
     pub user_id: Uuid,
     // TODO: This _should_ agree with the `autoDiscover.addNewBindings` from the `base_model`, but it is not required to.
@@ -28,7 +28,13 @@ pub struct Discover {
 }
 
 pub type ResourcePath = Vec<String>;
-pub type Changes = BTreeMap<ResourcePath, models::Collection>;
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct Changed {
+    pub target: models::Collection,
+    pub disable: bool,
+}
+pub type Changes = BTreeMap<ResourcePath, Changed>;
 
 #[derive(Debug)]
 pub struct DiscoverOutput {
@@ -36,7 +42,7 @@ pub struct DiscoverOutput {
     pub draft: tables::DraftCatalog,
     pub added: Changes,
     pub modified: Changes,
-    pub removed: Changes,
+    pub removed: BTreeMap<ResourcePath, models::Collection>,
 }
 
 impl DiscoverOutput {
@@ -63,6 +69,14 @@ impl DiscoverOutput {
         self.added.is_empty() && self.modified.is_empty() && self.removed.is_empty()
     }
 
+    /// Prunes any drafted specs that would be no-op changes. This includes
+    /// collection specs that are identical to the live specs, and any
+    /// collection specs that correspond to disabled bindings, regardless of
+    /// whether they are identical to the live specs. The `modified` set will
+    /// also be updated to remove mentions of such specs. The `added` set will
+    /// still contain records of the disabled bindings, though, even after the
+    /// collection specs themeselves have been pruned. This is because they
+    /// _were_ still added to the capture model, just in a disabled state.
     pub fn prune_unchanged_specs(&mut self) -> usize {
         assert!(
             self.draft.errors.is_empty(),
@@ -92,6 +106,8 @@ impl DiscoverOutput {
             let changed_collections = added
                 .values()
                 .chain(modified.values())
+                .filter(|changed| !changed.disable)
+                .map(|changed| &changed.target)
                 .collect::<HashSet<&models::Collection>>();
 
             draft.collections.retain(|row| {
@@ -102,6 +118,9 @@ impl DiscoverOutput {
                 retain
             });
         }
+        // Remove any modification changes that correspond to disabled bindings,
+        // since we've just removed the collection specs themselves.
+        self.modified.retain(|_, changed| !changed.disable);
         pruned_count
     }
 }
@@ -131,24 +150,13 @@ impl<C: Connectors> DiscoverHandler<C> {
     pub async fn discover(&mut self, db: &PgPool, req: Discover) -> anyhow::Result<DiscoverOutput> {
         let Discover {
             capture_name,
-            data_plane_name,
+            data_plane,
             logs_token,
             user_id,
             update_only,
             mut draft,
         } = req;
 
-        let mut data_planes: tables::DataPlanes = agent_sql::data_plane::fetch_data_planes(
-            db,
-            Vec::new(),
-            data_plane_name.as_str(),
-            user_id,
-        )
-        .await?;
-
-        let Some(data_plane) = data_planes.pop().filter(|d| d.is_default) else {
-            return Ok(DiscoverOutput::failed(capture_name, anyhow::anyhow!("data-plane {} could not be resolved. It may not exist or you may not be authorized", data_plane_name)));
-        };
         let Some(capture_def) = draft.captures.get_mut_by_key(&capture_name) else {
             return Ok(DiscoverOutput::failed(
                 capture_name.clone(),
@@ -159,6 +167,7 @@ impl<C: Connectors> DiscoverHandler<C> {
         let Some(models::CaptureEndpoint::Connector(connector_cfg)) =
             capture_def.model.as_ref().map(|m| &m.endpoint)
         else {
+            // TODO: better error message if drafted model is None
             anyhow::bail!("only connector endpoints are supported");
         };
 
@@ -209,7 +218,7 @@ impl<C: Connectors> DiscoverHandler<C> {
             }
         };
 
-        let output = Self::new_build_merged_catalog(
+        let output = Self::build_merged_catalog(
             capture_name,
             user_id,
             update_only,
@@ -235,7 +244,7 @@ impl<C: Connectors> DiscoverHandler<C> {
         Ok(output)
     }
 
-    async fn new_build_merged_catalog(
+    async fn build_merged_catalog(
         capture_name: models::Capture,
         user_id: uuid::Uuid,
         update_only: bool,
@@ -252,7 +261,20 @@ impl<C: Connectors> DiscoverHandler<C> {
             ref mut collections,
             ..
         } = &mut draft;
-        let capture_model = capture_def_mut(&capture_name, captures)?;
+        let Some(drafted_capture) = captures.get_mut_by_key(&capture_name) else {
+            anyhow::bail!("expected capture '{}' to exist in draft", capture_name);
+        };
+        let tables::DraftCapture {
+            model: Some(ref mut capture_model),
+            ref mut is_touch,
+            ..
+        } = drafted_capture
+        else {
+            anyhow::bail!(
+                "expected model to be drafted for capture '{}', but was a deletion",
+                capture_name
+            );
+        };
 
         let pointers = resource_path_pointers
             .iter()
@@ -285,6 +307,13 @@ impl<C: Connectors> DiscoverHandler<C> {
             specs::merge_collections(used_bindings, collections, &live.collections)?;
         // Don't report a binding as both added and modified, because that'd just be confusing
         modified_bindings.retain(|path, _| !added_bindings.contains_key(path));
+
+        if !added_bindings.is_empty()
+            || !modified_bindings.is_empty()
+            || !removed_bindings.is_empty()
+        {
+            *is_touch = false; // We're modifying the capture, so it's no longer a touch
+        }
 
         Ok(DiscoverOutput {
             capture_name,

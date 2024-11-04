@@ -385,6 +385,9 @@ impl PublicationStatus {
     // TODO: fold touch publication into history
     pub fn record_result(&mut self, publication: PublicationInfo) {
         tracing::info!(pub_id = ?publication.id, status = ?publication.result, "controller finished publication");
+        for err in publication.errors.iter() {
+            tracing::debug!(?err, "publication error");
+        }
         let maybe_new_entry = if let Some(last_entry) = self.history.front_mut() {
             last_entry.try_reduce(publication)
         } else {
