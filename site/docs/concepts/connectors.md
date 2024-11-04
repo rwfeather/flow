@@ -21,7 +21,7 @@ for optimal performance within the Flow ecosystem.
 
 Estuary’s vision is to provide a common runtime against which any open connector may be run.
 To that end, Flow currently supports the
-[Airbyte specification](https://docs.airbyte.io/understanding-airbyte/airbyte-specification)
+[Airbyte protocol](https://docs.airbyte.com/understanding-airbyte/airbyte-protocol)
 as well as Flow’s low-latency gRPC protocols for captures and materializations.
 
 ## Using connectors
@@ -294,7 +294,7 @@ For help completing this task on different cloud hosting platforms,
 see the documentation for the [connector](../reference/Connectors/README.md) you're using.
 :::
 
-[SHH tunneling](https://www.ssh.com/academy/ssh/tunneling/example#local-forwarding), or port forwarding,
+[SSH tunneling](https://www.ssh.com/academy/ssh/tunneling/example#local-forwarding), or port forwarding,
 provides a means for Flow to access the port indirectly through an SSH server.
 SSH tunneling is available in Estuary connectors for endpoints that use a network address for connection.
 
