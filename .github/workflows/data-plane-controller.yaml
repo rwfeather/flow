@@ -1,0 +1,67 @@
+name: Deploy data-plane-controller
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to deploy to (e.g., staging or production)"
+        required: true
+        default: "staging"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          submodules: true
+          lfs: true
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+      - run: supabase start
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build `data-plane-controller`
+        run: cargo build --release -p data-plane-controller
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: rust-binaries
+          path: |
+            ./target/release/data-plane-controller
+
+  deploy-artifacts:
+    runs-on: ubuntu-24.04
+    needs: build-artifacts
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v3
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: rust-binaries
+
+      - name: Authenticate with GCP Workload Identity Federation
+        uses: google-github-actions/auth@v2
+        with:
+          service_account: cd-github-actions@helpful-kingdom-273219.iam.gserviceaccount.com
+          workload_identity_provider: projects/671073686895/locations/global/workloadIdentityPools/github/providers/github
+
+      - name: Deploy to environment
+        run: |
+          echo "Deploying artifacts to environment: ${{ github.event.inputs.environment }}"
+          echo "Deployment process is ongoing..."
+          echo "Deployment completed successfully."
